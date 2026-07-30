@@ -135,12 +135,31 @@ def character_from_filename(path: Path | str) -> str:
 # Across characters
 # --------------------------------------------------------------------------- #
 STALE_AFTER = timedelta(days=7)
-"""How old a dump gets before its locations deserve a warning.
+"""How old a dump gets before its locations deserve a warning, by default.
 
-Nothing enforces this — a dump is a photograph, and the plugin has no way to
-know you moved something an hour later. Showing the age is the honest option;
-silently presenting week-old bag slots as fact is not.
+Seven days is right for a mule that never moves and far too generous for a
+main, so it's a setting — every function here takes an ``after`` override and
+this is only the fallback.
+
+Nothing enforces it either way. A dump is a photograph, and the plugin has no
+way to know you moved something an hour later. Showing the age is the honest
+option; silently presenting week-old bag slots as fact is not.
 """
+
+
+def humanize_age(age: timedelta) -> str:
+    """A rough age a human scans rather than reads: ``4h``, ``3d``, ``6w``.
+
+    Deliberately coarse and deliberately never zero — "0h old" reads like a
+    bug, and the question this answers ("can I still trust this bag slot?")
+    never turns on the difference between fifty and seventy minutes.
+    """
+    days = max(0, age.days)
+    if days >= 14:
+        return f"{days // 7}w"
+    if days >= 1:
+        return f"{days}d"
+    return f"{max(1, age.seconds // 3600)}h"
 
 
 @dataclass(frozen=True)
@@ -151,6 +170,13 @@ class CharacterInventory:
     server: str
     captured_at: datetime
     items: list[InventoryItem] = field(default_factory=list)
+    source_path: str = ""
+    """The file it was read from, so it can be reloaded without a dialog.
+
+    Empty for anything restored from v3 storage or loaded from text directly.
+    Kept as a string rather than a ``Path`` because it round-trips through JSON
+    and may well name a file that no longer exists.
+    """
 
     @property
     def key(self) -> str:
@@ -161,6 +187,9 @@ class CharacterInventory:
 
     def is_stale(self, now: datetime, *, after: timedelta = STALE_AFTER) -> bool:
         return self.age(now) > after
+
+    def age_text(self, now: datetime) -> str:
+        return humanize_age(self.age(now))
 
 
 @dataclass(frozen=True)
@@ -180,24 +209,25 @@ class Holding:
     def item_id(self) -> int:
         return self.item.item_id
 
-    def where(self, now: datetime | None = None) -> str:
+    @property
+    def count(self) -> int:
+        return self.item.count
+
+    def age(self, now: datetime) -> timedelta:
+        return now - self.captured_at
+
+    def is_stale(self, now: datetime, *, after: timedelta = STALE_AFTER) -> bool:
+        return self.age(now) > after
+
+    def where(self, now: datetime | None = None, *, after: timedelta = STALE_AFTER) -> str:
         """``Xantik · General1-Slot1``, with an age when the dump is stale."""
         base = f"{self.character} · {self.item.location}"
         if now is None:
             return base
-        age = now - self.captured_at
-        if age > STALE_AFTER:
-            return f"{base} ({_humanize(age)} old)"
+        age = self.age(now)
+        if age > after:
+            return f"{base} ({humanize_age(age)} old)"
         return base
-
-
-def _humanize(age: timedelta) -> str:
-    days = max(0, age.days)
-    if days >= 14:
-        return f"{days // 7}w"
-    if days >= 1:
-        return f"{days}d"
-    return f"{max(1, age.seconds // 3600)}h"
 
 
 def inventory_key(character: str, server: str) -> str:
@@ -224,6 +254,7 @@ class InventoryVault:
         items: list[InventoryItem],
         *,
         captured_at: datetime,
+        source_path: str = "",
     ) -> CharacterInventory:
         """Record (or replace) one character's dump."""
         record = CharacterInventory(
@@ -231,9 +262,13 @@ class InventoryVault:
             server=server.strip(),
             captured_at=captured_at,
             items=list(items),
+            source_path=source_path,
         )
         self._by_key[record.key] = record
         return record
+
+    def get(self, character: str, server: str) -> CharacterInventory | None:
+        return self._by_key.get(inventory_key(character, server))
 
     def drop(self, character: str, server: str) -> None:
         self._by_key.pop(inventory_key(character, server), None)
@@ -268,6 +303,7 @@ class InventoryVault:
                 "character": record.character,
                 "server": record.server,
                 "captured_at": record.captured_at.isoformat(),
+                "source_path": record.source_path,
                 "items": [
                     {
                         "location": item.location,
@@ -316,6 +352,7 @@ class InventoryVault:
                 server=str(raw.get("server", "")),
                 captured_at=captured_at,
                 items=items,
+                source_path=str(raw.get("source_path", "") or ""),
             )
         return vault
 

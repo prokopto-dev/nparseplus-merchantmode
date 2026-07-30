@@ -1,8 +1,8 @@
 # Merchant Mode
 
 An [nParse+](https://github.com/prokopto-dev/nparse-plus) plugin that turns your
-inventory into linkable WTS auction macros, and tracks prices on both sides of
-the trade.
+inventory into linkable WTS auction macros, finds which mule is holding what,
+and tracks prices on both sides of the trade.
 
 Selling on P99 means hand-typing item links into `/auction`. Each link costs 47
 raw bytes before its label, the social line buffer is a hard 255, and a link cut
@@ -39,10 +39,11 @@ server it came from rather than guessing.
 
 **Where** answers the question that actually matters the moment a buyer says
 yes: which alt is holding this, and in which bag slot. A dump is a photograph,
-though — the plugin can't know you moved something afterwards — so anything
-older than a week is marked with its age (`Mulebank · General1-Slot1 (4w old)`),
-and the status line names which characters are going stale. Capture time comes
-from the dump file's own mtime, not from when you loaded it.
+though — the plugin can't know you moved something afterwards — so anything past
+the staleness threshold is marked with its age (`Mulebank · General1-Slot1 (4w
+old)`), and the status line names which characters are going stale and points at
+the [Dumps tab](#dumps--how-old-is-any-of-this). Capture time comes from the
+dump file's own mtime, not from when you loaded it.
 
 **ID** carries each item's provenance. `CONFLICT !` means your dump and PigParse
 disagree, which matters because a wrong ID fails *silently*: the link renders
@@ -51,6 +52,29 @@ shows both candidates and which one the link will use.
 
 The status line counts **raw bytes**, not characters — that is what the client
 charges.
+
+### Find — who's holding it, right now, while they're still asking
+
+![The Find tab: a search for "long sword" returning two holdings, one on Xantik dumped 22 hours ago and one on the Mulebank flagged stale in red, each with its bag slot, count and server](assets/screenshots/window--find.png)
+
+A buyer asks *"do you have a Fungi?"* and you have a few seconds to answer.
+Type part of it and this tells you which character is holding it, in which bag
+slot, how many, and how old that knowledge is.
+
+The buyer never types the name your dump uses. So the query walks a ladder:
+exact first, then the same nickname-and-acronym resolution the pricing path
+uses (`fungi`, `FCST`, a fumbled spelling), then plain substring for the "I only
+remember part of it" case. An exact hit is never pushed below a substring hit —
+ranking is most of the job here, since a list you have to scroll isn't an
+answer.
+
+Unlike the Sell tab, this deliberately searches **every server**. "Can I sell
+this to you" is a one-server question; "is it anywhere on the account" is not,
+so every row names its server rather than the list being quietly filtered to
+one.
+
+This searches your **bags**. The Market tab searches the ~25,000-name item list
+— a different question, and the two are kept apart on purpose.
 
 ### Buy — items you don't own, with IDs and prices attributed
 
@@ -65,7 +89,7 @@ came from**. An unattributed price is one you'd have to take on faith.
 
 ### Market — look up any item, not just the ones you own
 
-![The Market tab: a search for "cloak of f", with Cloak of Flames selected showing WTS averages and sale counts across four windows, local /auc sightings, and the raw auction feed below](assets/screenshots/window--market.png)
+![The Market tab: a search for "cloak of f", with Cloak of Flames selected showing a price chart above the four averaging windows and their sale counts, live /auc sightings plotted against the PigParse baseline with a red spread column, and the raw auction feed below](assets/screenshots/window--market.png)
 
 Search any item by name and see PigParse's whole WTS block: the 30-day, 90-day,
 6-month and all-time averages **each beside its sample count**. That pairing is
@@ -74,6 +98,36 @@ very different facts, and an average without its sample size isn't an answer.
 The suggested price picks the narrowest window with enough sales behind it,
 because a six-month figure is still carrying whatever the item cost before the
 last patch.
+
+The chart above the figures is there because the *shape* of those four numbers
+is the interesting part, and a column of platinum values hides it. 30-day well
+above all-time means the item is climbing. Two hundred all-time sales and two in
+the last ninety days means the market for it is gone. Both are one glance in the
+bars and arithmetic in the table.
+
+- **Bar opacity is the sample count.** A 30-day average built on two sales is
+  drawn faintly; an all-time average on two hundred is drawn solid. The count is
+  printed above each bar as well, because opacity is a feeling and the number is
+  the fact. A window PigParse knows nothing about gets a dotted stub, so
+  *missing* never looks like *cheap*.
+- **Live sightings are plotted against the PigParse baseline** — the dashed line
+  is the same number *Fill prices* would use, so the chart and the price box can
+  never disagree. WTS is a filled dot and WTB is hollow: what someone will pay
+  and what someone is asking are different facts, and averaging them together is
+  how a plugin talks you into the wrong price.
+- **The column on the right is the spread** — low, median, high. It turns red
+  when the top ask is at least double the bottom, and the line underneath says
+  so in words. Two very different asks for the same item is a common P99 pattern
+  rather than a curiosity, and the median alone hides it completely.
+
+Both halves share one platinum axis on purpose. "Am I asking above or below what
+the channel is doing tonight" is a comparison, and two independently-scaled
+panels would make it a guess.
+
+No new dependency was added to draw any of this — the widget is a `paintEvent`,
+and everything it draws (which windows are trustworthy, where the baseline is,
+whether there is anything to draw at all) is decided in `chartdata.py`, which is
+Qt-free and unit-tested like the rest of the domain code.
 
 PigParse has no search endpoint — it only answers about exact names — so the
 search box matches locally first, against a bundled list of every P99 item name
@@ -84,9 +138,42 @@ Below that, the raw `/auction` feed as it scrolls past — both halves of a line
 so `WTS foo 5k WTB bar 2k` lands as two rows on opposite sides. Clicking a row
 opens that item in the detail panel.
 
+### Dumps — how old is any of this?
+
+![The Dumps tab: two loaded dumps with item counts and capture timestamps, the month-old one flagged stale in red, reload and forget buttons, and a summary saying 1 of 2 dumps is over 7 days old](assets/screenshots/window--dumps.png)
+
+Every location this plugin shows you is a photograph of a moment that may be
+weeks gone. This is the view that says so **before** you trust it, rather than
+in one cell of a table after you already have.
+
+One row per loaded dump, with an absolute timestamp *and* a relative age,
+because they answer different questions: `3d` is what you scan for, the
+timestamp is what you check when the relative age looks wrong. Anything past
+your threshold is flagged, and the count is repeated on the Sell tab's status
+line — a warning you have to open a panel to find is a warning you meet after
+the mistake.
+
+**Reload selected** re-reads a dump from the file it came from. Seeing a stale
+row is exactly the moment you want that, and having to re-find the file in a
+dialog is the reason you wouldn't bother. Dumps loaded before v0.3.0 have no
+remembered path; those say so and send you to the Sell tab. **Forget selected**
+drops a character entirely, along with any listings of theirs.
+
+The threshold is a [setting](#settings-1). Seven days is right for a mule that
+never moves and far too generous for a main.
+
+Two honest caveats, both stated in the tab itself:
+
+- **The age is the file's write time, not the in-game dump time.** They agree
+  when `/outputfile inventory` writes the file directly, which is the normal
+  case. Copying a dump between machines, restoring a backup, or a syncing folder
+  can reset it — and then a two-month-old inventory reads as fresh.
+- **Staleness is advisory, never enforcement.** The plugin cannot know you moved
+  something an hour after dumping. It shows the age; you judge.
+
 ### Settings
 
-![The settings page: pause between macro lines, max socials, poll interval, abbreviation toggle, and line prefix](assets/screenshots/settings--merchant-mode.png)
+![The settings page: pause between macro lines, max socials, poll interval, staleness threshold, abbreviation toggle, and line prefix](assets/screenshots/settings--merchant-mode.png)
 
 ---
 
@@ -195,6 +282,11 @@ rather than being dropped. Set the pause to `0` in settings to get all five back
 
 Re-dump a character whenever you've moved things around — the **Where** column
 is only as fresh as the last dump, and it will tell you when it's getting old.
+The **Dumps** tab reloads one in place once you've re-run `/outputfile`.
+
+When a buyer asks whether you have something, the **Find** tab is the fastest
+way there: type part of the name and it says which character, which bag slot,
+and how stale that answer is.
 
 Item names can be abbreviated in the link label — `CoF` opens Cloak of Flames
 just as well as the full name does, and buys you roughly a fourth item per line.
@@ -208,6 +300,7 @@ edit.
 | Pause between macro lines | `30` (3.0 s) | `0` disables; costs line slots |
 | Max socials per export | `4` | Overflow spills onto further buttons |
 | Price poll interval | `600 s` | PigParse cadence courtesy |
+| Warn about dumps older than | `7 days` | Advisory only; never blocks |
 | Abbreviate item names | on | Uses the nickname table |
 | Line prefix | `/auc WTS ` | Change the channel here |
 
@@ -223,10 +316,17 @@ uv venv && uv pip install -e ".[dev]"
 .venv/bin/python -m pytest -q && .venv/bin/nparseplus-plugin validate merchant_mode
 ```
 
-Domain logic (link encoding, packing, dump parsing, pricing) is Qt-free and
-unit-tested; Qt lives only in `window.py` and is imported inside the window
-factories, so the package stays importable without PySide6 or the host app.
-`tests/test_no_qt.py` enforces that rather than trusting it.
+Domain logic (link encoding, packing, dump parsing, pricing, held-item search,
+chart preparation) is Qt-free and unit-tested; Qt lives only in `window.py` and
+is imported inside the window factories, so the package stays importable without
+PySide6 or the host app. `tests/test_no_qt.py` enforces that rather than
+trusting it, and the list of modules it checks is the list you add to.
+
+That line is drawn tightly on purpose. `finding.py` ranks held items and knows
+nothing about a table; `chartdata.py` decides what a chart should say and knows
+nothing about pixels. Both are testable without a display, which is why the
+Find tab's ranking and the chart's skepticism about thin samples have real tests
+rather than a screenshot and some hope.
 
 The tests that matter most are in `tests/test_packing.py`. They reproduce the
 in-game probe that established the 255-byte limit byte-for-byte, and assert
@@ -249,9 +349,10 @@ synthetic-but-realistic data, and grabbed straight into `assets/screenshots/`:
 ```
 
 This needs the host app installed (`PluginWindow` resolves from it), which the
-`[dev]` extra provides. The seed deliberately produces a nearly-full byte budget
-and one of every ID badge, so the README shows the states that are hardest to
-describe in prose — `tests/test_capture_screenshots.py` asserts it still does,
+`[dev]` extra provides. The seed deliberately produces a nearly-full byte
+budget, one of every ID badge, a month-stale mule, and an evening of auctions
+that disagree with each other — so the README shows the states that are hardest
+to describe in prose. `tests/test_capture_screenshots.py` asserts it still does,
 so the pictures can't quietly stop matching the words.
 
 ## Licence

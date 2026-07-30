@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +37,10 @@ from nparseplus_sdk import (
 
 from .auctions import PriceHistory
 from .catalog import ItemCatalog
+from .chartdata import PriceChart, build_chart
+from .finding import HoldingMatch, find_holdings
 from .inventory import (
+    STALE_AFTER,
     CharacterInventory,
     Holding,
     InventoryItem,
@@ -57,13 +60,25 @@ from .socialpack import DEFAULT_PAUSE_TENTHS, MAX_PAUSE_TENTHS, build_pack, writ
 
 __all__ = ["MerchantModePlugin", "create_plugin"]
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 """Storage layout. v1 kept no inventories; v2 retains one dump per character;
 v3 keeps PigParse's whole stats block per item instead of a bare average, and
-remembers which server you last dumped on."""
+remembers which server you last dumped on; v4 remembers the file each dump came
+from, so a stale one can be reloaded without hunting for it again.
+
+Every version is read by the one after it. A v3 store simply has no source
+paths, and its dumps reload through the file dialog the way they always did."""
 
 DEFAULT_POLL_SECONDS = 600
 MIN_POLL_SECONDS = 60
+DEFAULT_STALE_DAYS = int(STALE_AFTER.total_seconds() // 86400)
+MIN_STALE_DAYS = 1
+MAX_STALE_DAYS = 90
+"""Bounds on the staleness threshold. Seven days is right for a mule that never
+moves and far too generous for a main, so the user gets to say — but a
+threshold of zero would mark every dump stale the moment it loaded, which is
+the same as having no warning at all."""
+
 MAX_PRICED_NAMES = 40
 """Cap on names sent to PigParse in one call — cadence courtesy.
 
@@ -122,10 +137,11 @@ class MerchantModePlugin(NParsePlugin):
     meta = PluginMeta(
         id="merchant-mode",
         name="Merchant Mode",
-        version="0.2.0",
+        version="0.3.0",
         description=(
-            "Turn your inventory into linkable WTS auction macros, look up what "
-            "anything is worth, and track prices on both sides of the trade."
+            "Turn your inventory into linkable WTS auction macros, find which "
+            "mule is holding what, look up what anything is worth, and see how "
+            "its price is actually moving."
         ),
         author="prokopto-dev",
         homepage="https://github.com/prokopto-dev/nparseplus-merchantmode",
@@ -153,6 +169,7 @@ class MerchantModePlugin(NParsePlugin):
         self._pause_tenths = DEFAULT_PAUSE_TENTHS
         self._poll_seconds = DEFAULT_POLL_SECONDS
         self._max_socials = DEFAULT_MAX_SOCIALS
+        self._stale_days = DEFAULT_STALE_DAYS
         self._abbreviate = True
         self._prefix = DEFAULT_PREFIX
         self._last_poll: datetime | None = None
@@ -185,8 +202,10 @@ class MerchantModePlugin(NParsePlugin):
                 factory=self._make_window,
                 # Wide enough for the Sell tab's five columns without eliding
                 # item names — the location column carries a character name too
-                # — and tall enough for its scope pickers and status line.
-                default_geometry=(220, 220, 660, 560),
+                # — and tall enough for the Market tab, which is now the one
+                # that sets the floor: a price chart, its figures, and the two
+                # feeds underneath don't compress below about 675.
+                default_geometry=(220, 220, 700, 700),
             )
         )
         ctx.add_settings_page(
@@ -239,21 +258,74 @@ class MerchantModePlugin(NParsePlugin):
         # case (same account, same server, EQ closed) needs no input at all.
         where = normalize_key(server) or self._active_server() or self._server
         stamp = captured_at or _dump_mtime(path)
+        self._store_dump(who, where, items, captured_at=stamp, source_path=str(path))
+        return len(items)
+
+    def _store_dump(
+        self,
+        character: str,
+        server: str,
+        items: list[InventoryItem],
+        *,
+        captured_at: datetime,
+        source_path: str,
+    ) -> None:
+        """File one character's items under one server, and remember the file."""
         with self._lock:
-            self._vault.put(who, where, items, captured_at=stamp)
+            self._vault.put(
+                character, server, items, captured_at=captured_at, source_path=source_path
+            )
             for item in items:
                 self._catalog.learn_owned(item.name, item.item_id)
-            if where:
-                self._server = where
+            if server:
+                self._server = server
             self._version += 1
             self._invalidate_matcher()
         self._persist()
+
+    def reload_dump(self, character: str, server: str) -> int:
+        """Re-read one character's dump from the file it came from.
+
+        Returns the sellable count, or 0 when there is no remembered path, the
+        file is gone, or it no longer parses — the caller is expected to fall
+        back to the file dialog rather than report a reload that didn't happen.
+        Reloading is the natural response to seeing a stale row, and making the
+        user re-find the file every time is the reason they wouldn't.
+
+        Deliberately does not go through :meth:`load_dump`, which *decides*
+        which server a dump belongs to. That decision has already been made and
+        re-making it would refile an unfiled dump under whatever is current,
+        leaving the original row stranded under a key nothing points at.
+        """
+        with self._lock:
+            record = self._vault.get(character, normalize_key(server))
+        if record is None or not record.source_path:
+            return 0
+        items = sellable(parse_inventory_file(record.source_path))
+        if not items:
+            return 0
+        self._store_dump(
+            record.character,
+            record.server,
+            items,
+            captured_at=_dump_mtime(record.source_path),
+            source_path=record.source_path,
+        )
         return len(items)
 
-    def forget_character(self, character: str, server: str = "") -> None:
-        """Drop one character's dump and any listings that referenced it."""
+    def forget_character(self, character: str, server: str | None = None) -> None:
+        """Drop one character's dump and any listings that referenced it.
+
+        ``server=None`` means "whichever one is in play"; ``""`` specifically
+        means the unfiled bucket, which is a real place a dump can live and
+        would otherwise be unreachable — passing it would have been read as
+        "unspecified" and dropped a different character's dump instead.
+        """
         with self._lock:
-            where = normalize_key(server) or self._server or self._active_server()
+            if server is None:
+                where = self._server or self._active_server()
+            else:
+                where = normalize_key(server)
             self._vault.drop(character, where)
             self._listings = [
                 listing
@@ -336,6 +408,31 @@ class MerchantModePlugin(NParsePlugin):
         """Which characters hold ``name``, and where."""
         with self._lock:
             return self._vault.locate(name)
+
+    def find_holdings(self, query: str, *, limit: int = 100) -> list[HoldingMatch]:
+        """Held items matching ``query``, across every server.
+
+        Deliberately unscoped where :meth:`holdings` is scoped: the Sell tab's
+        one-server rule exists because you can't sell across servers, but the
+        question this answers is "is it anywhere on the account at all", and an
+        answer that hid the Blue mule would be a wrong answer. Every result
+        carries its server so the follow-up question stays askable.
+        """
+        matcher = self.matcher()
+        with self._lock:
+            holdings = self._vault.holdings()
+        return find_holdings(query, holdings, matcher=matcher, limit=limit)
+
+    def stale_after(self) -> timedelta:
+        """How old a dump has to be before its locations get a warning."""
+        with self._lock:
+            return timedelta(days=self._stale_days)
+
+    def stale_dumps(self, now: datetime | None = None) -> list[CharacterInventory]:
+        """Loaded dumps past the threshold, most recently captured first."""
+        stamp = now or datetime.now()
+        after = self.stale_after()
+        return [record for record in self.inventories() if record.is_stale(stamp, after=after)]
 
     def items(self) -> list[InventoryItem]:
         """Flat item list across all characters (kept for convenience)."""
@@ -739,6 +836,20 @@ class MerchantModePlugin(NParsePlugin):
         with self._lock:
             return self._history.recent(name, limit=limit, matcher=matcher)
 
+    def chart_for(self, name: str, *, limit: int = 200) -> PriceChart:
+        """Everything the price panel draws for ``name``.
+
+        Assembled here rather than in the window so the window's paint code
+        gets a finished answer: what it draws, and whether there is anything to
+        draw at all, are decisions with reasons behind them and both belong on
+        this side of the Qt line.
+        """
+        return build_chart(
+            name,
+            record=self.market_for(name),
+            observations=self.observations_for(name, limit=limit),
+        )
+
     # --- snapshot for the window (GUI thread) ------------------------------
     def snapshot(self) -> dict:
         """A consistent read of everything the window draws."""
@@ -760,6 +871,7 @@ class MerchantModePlugin(NParsePlugin):
                 "server": self._server or self._active_server(),
                 "status": self._status,
                 "busy": self._in_flight > 0,
+                "stale_days": self._stale_days,
             }
 
     def resolve_id(self, name: str):
@@ -803,6 +915,7 @@ class MerchantModePlugin(NParsePlugin):
                 MIN_POLL_SECONDS, _as_int(stored.get("poll_seconds"), DEFAULT_POLL_SECONDS)
             )
             self._max_socials = max(1, _as_int(stored.get("max_socials"), DEFAULT_MAX_SOCIALS))
+            self._stale_days = self._clamp_stale(stored.get("stale_days", DEFAULT_STALE_DAYS))
             self._abbreviate = bool(stored.get("abbreviate", True))
             self._prefix = str(stored.get("prefix") or DEFAULT_PREFIX)
             self._wanted = [str(name) for name in stored.get("wanted", []) if str(name).strip()]
@@ -857,6 +970,7 @@ class MerchantModePlugin(NParsePlugin):
                 "pause_tenths": self._pause_tenths,
                 "poll_seconds": self._poll_seconds,
                 "max_socials": self._max_socials,
+                "stale_days": self._stale_days,
                 "abbreviate": self._abbreviate,
                 "prefix": self._prefix,
                 "wanted": list(self._wanted),
@@ -882,6 +996,10 @@ class MerchantModePlugin(NParsePlugin):
     def _clamp_pause(value: object) -> int:
         return max(0, min(MAX_PAUSE_TENTHS, _as_int(value, DEFAULT_PAUSE_TENTHS)))
 
+    @staticmethod
+    def _clamp_stale(value: object) -> int:
+        return max(MIN_STALE_DAYS, min(MAX_STALE_DAYS, _as_int(value, DEFAULT_STALE_DAYS)))
+
     # --- settings ----------------------------------------------------------
     def settings(self) -> dict:
         with self._lock:
@@ -889,6 +1007,7 @@ class MerchantModePlugin(NParsePlugin):
                 "pause_tenths": self._pause_tenths,
                 "poll_seconds": self._poll_seconds,
                 "max_socials": self._max_socials,
+                "stale_days": self._stale_days,
                 "abbreviate": self._abbreviate,
                 "prefix": self._prefix,
             }
@@ -903,6 +1022,8 @@ class MerchantModePlugin(NParsePlugin):
                 )
             if "max_socials" in values:
                 self._max_socials = max(1, _as_int(values["max_socials"], self._max_socials))
+            if "stale_days" in values:
+                self._stale_days = self._clamp_stale(values["stale_days"])
             if "abbreviate" in values:
                 self._abbreviate = bool(values["abbreviate"])
             if "prefix" in values:

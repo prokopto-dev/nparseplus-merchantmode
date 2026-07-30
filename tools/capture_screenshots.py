@@ -46,11 +46,13 @@ NOW = datetime(2026, 7, 30, 21, 0, 0)
 PANEL_BACKDROP = "#1b1d23"
 
 # Tall enough for the Sell tab's scope pickers and status line, and for the
-# Market tab's search/detail split — resize() cannot go below a layout's
-# minimum, so a size that's too small silently captures a different window
-# than the one it asked for.
-WINDOW_SIZE = (660, 640)
-SETTINGS_SIZE = (520, 300)
+# Market tab's chart-over-figures detail panel, which is what actually sets the
+# floor — resize() cannot go below a layout's minimum, so a size that's too
+# small silently captures a different window than the one it asked for. If this
+# starts failing the smoke test, the window's minimum grew: read the new number
+# off the failure rather than nudging this one until it sticks.
+WINDOW_SIZE = (700, 700)
+SETTINGS_SIZE = (520, 420)
 
 # Top-level widgets have no QObject parent, so the only strong reference is the
 # local in each cap function. Once that drops the widget is collected, and
@@ -108,10 +110,20 @@ WANTED = [
 ]
 
 # Auction lines the plugin will parse into its price history, newest last.
+#
+# Cloak of Flames gets an evening's worth on purpose: it is the item the Market
+# shot lands on, and one sighting draws a chart with a single dot on it, which
+# documents nothing. The asks deliberately run 4k to 9k, because a split market
+# is both common on P99 and the exact thing a median hides — the shot should
+# show the plugin saying so rather than the README claiming it does.
 AUCTIONS = [
     ("Tradesman", "WTS Manastone 42k | Fine Steel Long Sword 50pp"),
+    ("Cheapseller", "WTS Cloak of Flames 4k"),
     ("Buyerguy", "WTB Guise of the Deceiver 98k"),
+    ("Twinkfunder", "WTS Cloak of Flames 4.2k"),
     ("Vendorbot", "WTS Bone Chips 2pp ea. | Rusty Long Sword 5pp"),
+    ("Barterer", "WTS Cloak of Flames 5.5k"),
+    ("Optimist", "WTS Cloak of Flames 9k"),
     ("Xantik", "WTS Cloak of Flames 5k"),
     ("Richguy", "WTB Rubicite Breastplate 60k WTS Yaulp IV 400pp"),
 ]
@@ -211,9 +223,14 @@ def build_plugin(tmp_dir: Path):
     )
     plugin.set_wanted(WANTED)
 
+    # Spread over an evening rather than a minute apart: the price chart plots
+    # these against time, and nine sightings inside ten minutes draws a vertical
+    # smear instead of a trend.
     for offset, (sender, content) in enumerate(AUCTIONS):
         plugin.observe_auction(
-            content, timestamp=NOW - timedelta(minutes=len(AUCTIONS) - offset), sender=sender
+            content,
+            timestamp=NOW - timedelta(minutes=25 * (len(AUCTIONS) - offset)),
+            sender=sender,
         )
 
     # Prices arrive the way they really do — through the apply half of a submit.
@@ -270,7 +287,7 @@ def cap_market(window, name: str = "window--market") -> Path:
     """The Market tab mid-search, because empty is not what it looks like."""
     from PySide6.QtCore import Qt
 
-    window._tabs.setCurrentIndex(2)
+    window._tabs.setCurrentIndex(3)
     window._search_entry.setText("cloak of f")
     # Land on the one the seed has prices for — a shot of the detail panel
     # saying "no data yet" documents nothing.
@@ -281,10 +298,34 @@ def cap_market(window, name: str = "window--market") -> Path:
     return capture(window, name, size=WINDOW_SIZE)
 
 
+def cap_find(window, name: str = "window--find") -> Path:
+    """The Find tab answering a half-remembered name.
+
+    ``long sword`` is chosen because two different characters hold one and the
+    mule's is a month stale — so the shot carries the two things prose struggles
+    with: the answer pools across characters, and one of the answers is old.
+    """
+    window._tabs.setCurrentIndex(1)
+    window._find_entry.setText("long sword")
+    window._rendered_version = -1
+    window.refresh()
+    return capture(window, name, size=WINDOW_SIZE)
+
+
+def cap_dumps(window, name: str = "window--dumps") -> Path:
+    """The Dumps tab, with one fresh dump and one a month gone."""
+    window._tabs.setCurrentIndex(4)
+    window._rendered_version = -1
+    window.refresh()
+    return capture(window, name, size=WINDOW_SIZE)
+
+
 SHOTS = {
     "window--sell": lambda w, c: cap_tab(w, 0, "window--sell"),
-    "window--buy": lambda w, c: cap_tab(w, 1, "window--buy"),
+    "window--find": lambda w, c: cap_find(w),
+    "window--buy": lambda w, c: cap_tab(w, 2, "window--buy"),
     "window--market": lambda w, c: cap_market(w),
+    "window--dumps": lambda w, c: cap_dumps(w),
     "settings--merchant-mode": lambda w, c: cap_settings(c),
 }
 

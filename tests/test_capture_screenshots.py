@@ -93,3 +93,36 @@ def test_the_sell_screenshot_shows_a_nearly_full_line_budget(tmp_path) -> None:
         for line in social["lines"]
     )
     assert 200 <= widest <= 255
+
+
+def test_every_readme_shot_still_has_a_recipe() -> None:
+    """The README embeds these by name; a renamed tab shouldn't orphan one."""
+    assert set(cap.SHOTS) == {
+        "window--sell",
+        "window--find",
+        "window--buy",
+        "window--market",
+        "window--dumps",
+        "settings--merchant-mode",
+    }
+
+
+def test_the_seed_gives_the_market_shot_a_split_market(tmp_path) -> None:
+    """The Market shot's argument is that a median can hide two markets.
+
+    If the seeded auctions ever stopped disagreeing, the chart would draw a
+    tidy cluster and the README would keep claiming the plugin catches this.
+    """
+    plugin, _ctx = cap.build_plugin(tmp_path / "seed")
+    chart = plugin.chart_for("Cloak of Flames")
+    assert chart.has_windows and chart.has_observations
+    assert chart.sell.wide
+    assert chart.sell.count >= 5
+
+
+def test_the_find_shot_spans_two_characters_with_one_stale(tmp_path) -> None:
+    """The Find shot exists to show pooling and age together."""
+    plugin, _ctx = cap.build_plugin(tmp_path / "seed")
+    found = plugin.find_holdings("long sword")
+    assert {match.character for match in found} == {"Xantik", "Mulebank"}
+    assert [match.is_stale(cap.NOW) for match in found].count(True) == 1
