@@ -476,9 +476,11 @@ def test_a_v1_store_upgrades_without_losing_anything_it_had() -> None:
 
 
 def test_saving_stamps_the_current_schema_version() -> None:
+    from merchant_mode import SCHEMA_VERSION
+
     plugin, ctx = _activated()
     plugin.set_wanted(["Manastone"])
-    assert ctx.storage.data["schema_version"] == 2
+    assert ctx.storage.data["schema_version"] == SCHEMA_VERSION == 3
 
 
 def test_inventories_survive_a_restart(tmp_path) -> None:
@@ -517,3 +519,204 @@ def test_snapshot_version_advances_when_state_changes() -> None:
 def test_deactivate_persists_without_a_context() -> None:
     # deactivate() may run before activate() ever did; it must not explode.
     create_plugin().deactivate()
+
+
+# --- price fetching --------------------------------------------------------
+#
+# The regression these cover: fetching used to be gated on ctx.player.server,
+# which is unset whenever EQ isn't running — i.e. whenever you actually load a
+# dump. No call ever went out, both caches stayed empty, and "Fill prices"
+# reported that there was nothing to fill. It looked like a broken button and
+# was really a fetch that never happened.
+
+
+class _FakeItemPrice:
+    """Shaped like the host's PigParse ``ItemPrice``, for the fields read."""
+
+    def __init__(self, name: str, item_id: int, average: int, *, samples: int = 0) -> None:
+        self.item_name = name
+        self.eq_item_id = item_id
+        self.total_wts_last_30_days_average = 0
+        self.total_wts_last_30_days_count = 0
+        self.total_wts_last_90_days_average = 0
+        self.total_wts_last_90_days_count = 0
+        self.total_wts_last_6_months_average = average
+        self.total_wts_last_6_months_count = samples
+        self.total_wts_auction_average = average
+        self.total_wts_auction_count = samples
+        self.last_wts_seen = None
+
+
+def _seeded(tmp_path, *, server: str = "green"):
+    plugin, ctx = _activated()
+    plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server=server)
+    plugin.set_listings([Listing(11621, "Cloak of Flames"), Listing(1234, "Guise of the Deceiver")])
+    return plugin, ctx
+
+
+def test_prices_are_fetched_with_no_live_session(tmp_path) -> None:
+    plugin, ctx = _seeded(tmp_path)
+    assert ctx.player is None  # EQ closed: the case that used to fetch nothing
+
+    assert plugin.request_prices(["Cloak of Flames"]) is True
+    ctx.pigparse.item_prices = lambda server, names: [
+        _FakeItemPrice("Cloak of Flames", 11621, 5000, samples=9)
+    ]
+    ctx.run_submitted()
+    assert plugin.market_for("Cloak of Flames").headline == 5000
+
+
+def test_fetching_declines_and_says_why_without_a_server(tmp_path) -> None:
+    plugin, _ctx = _seeded(tmp_path, server="")
+    assert plugin.server() == ""
+    assert plugin.request_prices(["Cloak of Flames"]) is False
+    assert "server" in plugin.status().casefold()
+
+
+def test_the_dump_server_reaches_pigparse_as_its_wire_int(tmp_path) -> None:
+    plugin, ctx = _seeded(tmp_path, server="blue")
+    seen: list = []
+    ctx.pigparse.item_prices = lambda server, names: seen.append(server) or []
+    plugin.request_prices(["Cloak of Flames"])
+    ctx.run_submitted()
+    assert seen == [1]  # Server.BLUE — not the string, and not Green's 0
+
+
+def test_fill_prices_uses_a_fetched_average(tmp_path) -> None:
+    plugin, ctx = _seeded(tmp_path)
+    ctx.pigparse.item_prices = lambda server, names: [
+        _FakeItemPrice("Cloak of Flames", 11621, 5000, samples=9)
+    ]
+    plugin.request_prices(["Cloak of Flames"])
+    ctx.run_submitted()
+
+    assert plugin.fill_prices() == 1
+    priced = {listing.name: listing.price for listing in plugin.snapshot()["listings"]}
+    assert priced["Cloak of Flames"] == "5k"
+
+
+def test_unpriced_listings_is_what_the_fill_button_should_go_and_ask_about(tmp_path) -> None:
+    plugin, _ctx = _seeded(tmp_path)
+    assert set(plugin.unpriced_listings()) == {"Cloak of Flames", "Guise of the Deceiver"}
+
+
+def test_polling_advances_instead_of_re_asking_for_the_same_names(tmp_path) -> None:
+    """The 40-name cap used to be applied to the same list every poll, so an
+    inventory larger than the cap never got past its first forty items."""
+    from merchant_mode import MAX_PRICED_NAMES
+
+    plugin, ctx = _activated()
+    plugin.set_server("green")
+    plugin.set_wanted([f"Item Number {n}" for n in range(MAX_PRICED_NAMES + 5)])
+
+    first = plugin._pending_price_names()
+    assert len(first) == MAX_PRICED_NAMES
+
+    ctx.pigparse.item_prices = lambda server, names: [
+        _FakeItemPrice(name, 1, 100, samples=3) for name in names
+    ]
+    plugin.request_prices(first)
+    ctx.run_submitted()
+
+    second = plugin._pending_price_names()
+    assert set(second).isdisjoint(first)
+    assert len(second) == 5
+
+
+# --- name matching ---------------------------------------------------------
+
+
+def test_auction_nicknames_attach_to_the_item_you_own(tmp_path) -> None:
+    """``WTS Fungi 27k`` is a price for Fungus Covered Scale Tunic.
+
+    Matching was exact case-folded equality, so the channel's own shorthand —
+    which is what people actually type — never matched anything in a dump.
+    """
+    from merchant_mode.pricing import PriceSource
+
+    plugin, _ctx = _activated()
+    plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server="green")
+    plugin.observe_auction("WTS Guise 88k", timestamp=T0, sender="Someone")
+
+    proposal = plugin.suggest_price("Guise of the Deceiver")
+    assert proposal.text == "88k"
+    assert proposal.source is PriceSource.OBSERVED
+
+
+def test_a_typo_in_the_channel_still_matches(tmp_path) -> None:
+    plugin, _ctx = _activated()
+    plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server="green")
+    plugin.observe_auction("WTS Cloack of Flames 6k", timestamp=T0)
+    assert plugin.suggest_price("Cloak of Flames").text == "6k"
+
+
+def test_an_unrelated_item_does_not_match(tmp_path) -> None:
+    plugin, _ctx = _activated()
+    plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server="green")
+    plugin.observe_auction("WTS Rusty Long Sword 5pp", timestamp=T0)
+    assert not plugin.suggest_price("Cloak of Flames").known
+
+
+# --- server scoping --------------------------------------------------------
+
+
+def test_holdings_scope_to_one_server(tmp_path) -> None:
+    plugin, _ctx = _activated()
+    plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server="green")
+    plugin.load_dump(_dump(tmp_path, "Mulebank", MULE_DUMP), server="blue")
+
+    assert plugin.dumped_servers() == ["blue", "green"] or plugin.dumped_servers() == [
+        "green",
+        "blue",
+    ]
+    assert plugin.characters_on("green") == ["Xantik"]
+    assert plugin.characters_on("blue") == ["Mulebank"]
+    assert {holding.name for holding in plugin.holdings(server="blue")} == {
+        "Manastone",
+        "Rubicite Breastplate",
+    }
+    # No filter still means everything — the UI just never asks for that.
+    assert len(plugin.holdings()) == 5
+
+
+def test_a_dump_with_no_server_stays_visible_in_its_own_bucket(tmp_path) -> None:
+    """Unfiled dumps must be reachable, not silently absent.
+
+    A dump loaded before any server was chosen has ``server == ""``. Filtering
+    it out would make a successful load look like a failed one.
+    """
+    plugin, _ctx = _activated()
+    plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server="")
+    assert plugin.dumped_servers() == [""]
+    assert len(plugin.holdings(server="")) == 3
+
+
+# --- export ----------------------------------------------------------------
+
+
+def test_exporting_writes_where_it_is_told(tmp_path) -> None:
+    plugin, _ctx = _activated()
+    target = tmp_path / "somewhere" / "my-macros.json"
+    path, _result = plugin.export_pack([Listing(11621, "Cloak of Flames", "5k")], path=target)
+    assert path == target
+    assert target.exists()
+
+
+def test_v2_averages_survive_the_upgrade_to_v3() -> None:
+    """An upgrading user's Fill button must work before the first fetch.
+
+    v2 stored a bare 6-month average per name; v3 stores the whole block. The
+    old numbers are still the best thing known until a fetch replaces them.
+    """
+    ctx = FakePluginContext(MerchantModePlugin.meta)
+    ctx.storage.data = {
+        "schema_version": 2,
+        "averages": {"cloak of flames": 5000},
+        "listings": [{"item_id": 11621, "name": "Cloak of Flames", "price": ""}],
+    }
+    plugin = create_plugin()
+    plugin.activate(ctx)
+
+    assert plugin.market_for("Cloak of Flames").headline == 5000
+    assert plugin.fill_prices() == 1
+    assert plugin.snapshot()["listings"][0].price == "5k"

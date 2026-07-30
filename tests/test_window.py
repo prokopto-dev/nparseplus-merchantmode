@@ -69,7 +69,7 @@ def test_window_exposes_what_the_host_requires(built) -> None:
 def test_window_has_the_three_tabs(built) -> None:
     _plugin, _ctx, window = built
     tabs = [window._tabs.tabText(i) for i in range(window._tabs.count())]
-    assert tabs == ["Sell", "Want", "Prices"]
+    assert tabs == ["Sell", "Buy", "Market"]
 
 
 def test_loaded_inventory_renders_with_selection_state(built) -> None:

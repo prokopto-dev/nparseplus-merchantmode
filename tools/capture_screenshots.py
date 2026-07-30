@@ -16,7 +16,7 @@ Needs the host app installed, since ``PluginWindow`` resolves from it::
 
 The seeded data is chosen to show the states that are hard to describe in prose:
 a nearly-full byte budget on the Sell tab, and all four ID-provenance badges
-side by side on the Want tab — including the CONFLICT case that a real user
+side by side on the Buy tab — including the CONFLICT case that a real user
 would otherwise only meet when a link opened the wrong item.
 """
 
@@ -45,7 +45,11 @@ NOW = datetime(2026, 7, 30, 21, 0, 0)
 # a solid panel colour is what makes the rounded corners look right.
 PANEL_BACKDROP = "#1b1d23"
 
-WINDOW_SIZE = (660, 420)
+# Tall enough for the Sell tab's scope pickers and status line, and for the
+# Market tab's search/detail split — resize() cannot go below a layout's
+# minimum, so a size that's too small silently captures a different window
+# than the one it asked for.
+WINDOW_SIZE = (660, 640)
 SETTINGS_SIZE = (520, 300)
 
 # Top-level widgets have no QObject parent, so the only strong reference is the
@@ -93,7 +97,7 @@ SELLING = [
     ("Rubicite Breastplate", ""),  # blank on purpose: Fill prices has work to do
 ]
 
-# "Circlet of Shadow" is deliberately unknown to every source, so the Want tab
+# "Circlet of Shadow" is deliberately unknown to every source, so the Buy tab
 # demonstrates the "no ID yet" state alongside the resolved ones.
 WANTED = [
     "Manastone",
@@ -149,12 +153,35 @@ def _composite_and_save(src, name: str, backdrop: str, pad: int) -> Path:
 
 
 class _FakePrice:
-    """Shaped like a PigParse ``ItemPrice`` — only the fields we read."""
+    """Shaped like a PigParse ``ItemPrice`` — only the fields we read.
 
-    def __init__(self, item_name: str, eq_item_id: int | None, average: int) -> None:
+    The whole WTS block, not just the 6-month average: the Market tab shows
+    every averaging window beside its sample count, and a seed that filled in
+    one of them would produce a screenshot of an empty table.
+    """
+
+    def __init__(
+        self,
+        item_name: str,
+        eq_item_id: int | None,
+        average: int,
+        *,
+        samples: int = 0,
+        last_seen: datetime | None = None,
+    ) -> None:
         self.item_name = item_name
         self.eq_item_id = eq_item_id
+        # Narrower windows run slightly hot and thinner, the way a real market
+        # does; the counts taper the same way.
+        self.total_wts_last_30_days_average = round(average * 1.08)
+        self.total_wts_last_30_days_count = max(0, samples // 6)
+        self.total_wts_last_90_days_average = round(average * 1.03)
+        self.total_wts_last_90_days_count = max(0, samples // 3)
         self.total_wts_last_6_months_average = average
+        self.total_wts_last_6_months_count = samples
+        self.total_wts_auction_average = round(average * 0.96)
+        self.total_wts_auction_count = samples * 4
+        self.last_wts_seen = last_seen
 
 
 def build_plugin(tmp_dir: Path):
@@ -190,19 +217,22 @@ def build_plugin(tmp_dir: Path):
         )
 
     # Prices arrive the way they really do — through the apply half of a submit.
-    # The ids are chosen to produce one badge of each kind on the Want tab:
+    # The ids are chosen to produce one badge of each kind on the Buy tab:
     #   Guise    agrees with the dump?  no dump entry -> unverified
     #   Fungi    disagrees with the dump              -> CONFLICT
     #   Cloak    agrees with the dump                 -> confirmed
     #   Rubicite no price record at all               -> no ID yet
     plugin._apply_prices(
         [
-            _FakePrice("Manastone", 4567, 42000),
-            _FakePrice("Guise of the Deceiver", 1234, 98000),
-            _FakePrice("Yaulp IV", 3312, 400),
-            _FakePrice("Cloak of Flames", 11621, 5200),
-            _FakePrice("Fungus Covered Scale Tunic", 9999, 12500),
-        ]
+            _FakePrice("Manastone", 4567, 42000, samples=36, last_seen=NOW - timedelta(days=2)),
+            _FakePrice("Guise of the Deceiver", 1234, 98000, samples=18),
+            _FakePrice("Yaulp IV", 3312, 400, samples=9),
+            _FakePrice(
+                "Cloak of Flames", 11621, 5200, samples=54, last_seen=NOW - timedelta(hours=6)
+            ),
+            _FakePrice("Fungus Covered Scale Tunic", 9999, 12500, samples=27),
+        ],
+        server="green",
     )
     return plugin, ctx
 
@@ -236,10 +266,25 @@ def cap_settings(ctx, name: str = "settings--merchant-mode") -> Path:
     return capture(page, name, size=SETTINGS_SIZE)
 
 
+def cap_market(window, name: str = "window--market") -> Path:
+    """The Market tab mid-search, because empty is not what it looks like."""
+    from PySide6.QtCore import Qt
+
+    window._tabs.setCurrentIndex(2)
+    window._search_entry.setText("cloak of f")
+    # Land on the one the seed has prices for — a shot of the detail panel
+    # saying "no data yet" documents nothing.
+    matches = window._results.findItems("Cloak of Flames", Qt.MatchFlag.MatchExactly)
+    window._results.setCurrentItem(matches[0] if matches else window._results.item(0))
+    window._rendered_version = -1
+    window.refresh()
+    return capture(window, name, size=WINDOW_SIZE)
+
+
 SHOTS = {
     "window--sell": lambda w, c: cap_tab(w, 0, "window--sell"),
-    "window--want": lambda w, c: cap_tab(w, 1, "window--want"),
-    "window--prices": lambda w, c: cap_tab(w, 2, "window--prices"),
+    "window--buy": lambda w, c: cap_tab(w, 1, "window--buy"),
+    "window--market": lambda w, c: cap_market(w),
     "settings--merchant-mode": lambda w, c: cap_settings(c),
 }
 
