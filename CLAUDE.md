@@ -63,6 +63,14 @@ Nothing that prices, lists or advertises an item may call it.
 - **Never hide a row silently.** Filtered items are counted on the Sell tab's
   status line and on the Filters tab. A list quietly missing rows is worse than
   a cluttered one.
+- **Meet the gesture where it happens.** Every Sell-tab action is on both a
+  button and the row's right-click menu (`_items_menu`), because a feature you
+  can only find by reading the button bar is one most people never find. New
+  row actions belong in both. Keep the menu buildable without a pointer —
+  `_items_menu()` returns the `QMenu` and `_on_items_context_menu` only pops
+  it, which is what lets tests read and trigger entries. Anything that would
+  `exec()` a modal (`QMenu`, `QInputDialog`, `QMessageBox`) has to be patchable
+  from a test or reachable through a seam that isn't.
 - **Say when you don't know.** A stale dump reports its age, an unattributed
   price is refused, a disputed item id is marked. The failure mode designed
   against throughout is a *confident mistake*, not a miss.

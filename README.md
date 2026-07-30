@@ -79,6 +79,24 @@ plugin's copy, not the file, so reloading that character brings them back, and
 the dialog says so. For anything you never want to see again, **Filter out
 selected** writes a rule instead. See [Filters](#filters--the-things-you-never-sell).
 
+Both are also on the **right-click menu**, which is where you'll actually reach
+when a row of junk is under the pointer:
+
+- *Filter out "Bone Chips"* — one row, one click, no dialog. It's reversible on
+  the Filters tab and the status line reports the new count.
+- *Filter out items containing…* — prefilled with the name you clicked, so
+  turning `Large Bag` into "hide anything with **bag** in it" is one edit. It
+  lists what the rule would catch before adding it, and refuses a pattern that
+  matches nothing rather than leaving you a typo to discover later.
+- *Stop filtering* — on a filtered row (with *Show filtered* on), naming the
+  exact rule that caught it, and warning you if removing it brings back more
+  than the row you clicked.
+- *Remove n rows from this dump…* and *Manage filters…*, which opens the tab.
+
+Right-clicking a row you hadn't selected selects it first; right-clicking
+*inside* a selection leaves it alone, so "select five, right-click, filter them
+all out" works.
+
 The status line counts **raw bytes**, not characters — that is what the client
 charges — and says how many rows the filter list is keeping out of the table,
 because a list quietly missing rows is worse than a cluttered one.
@@ -250,9 +268,11 @@ comes straight back when a rule goes off — and every list that hides something
 says how many. Filters are also the one preference that is **account-wide**
 rather than per server: junk is junk everywhere.
 
-The fastest way to build the list isn't this tab at all: select the junk on the
-Sell tab and press **Filter out selected**. **Add suggested rules** drops in a
-short starter set — merchant bags, newbie armour, food and drink — as ordinary
+The fastest way to build the list isn't this tab at all: **right-click the junk
+on the Sell tab**, where you are already looking at it. This tab is where you
+come to see what the rules are doing, edit them, and switch them off — not
+where you'd expect to have to go to write one. **Add suggested rules** drops in
+a short starter set — merchant bags, newbie armour, food and drink — as ordinary
 rules you can edit or delete. Nothing is filtered until you say so.
 
 ### Settings
@@ -367,8 +387,8 @@ rather than being dropped. Set the pause to `0` in settings to get all five back
 2. Pick your **server** at the top of the window — it scopes every tab.
 3. **Sell** tab → *Load inventory dump…* (once per character) → tick what you're
    selling.
-4. Select the junk and *Filter out selected* the first time through. You do it
-   once; every dump after that arrives already tidy.
+4. Right-click the junk → *Filter out* the first time through. You do it once;
+   every dump after that arrives already tidy.
 5. *Fill prices* for the blanks, and type over anything you disagree with.
 6. *Export macro pack…* and choose where to save it.
 7. Open the host's Macro Editor, import the pack, and save to your character.

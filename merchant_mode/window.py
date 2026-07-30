@@ -39,9 +39,11 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSizePolicy,
@@ -554,7 +556,10 @@ class MerchantModeWindow(PluginWindow):
         self._tabs.addTab(self._build_buy_tab(), "Buy")
         self._tabs.addTab(self._build_market_tab(), "Market")
         self._tabs.addTab(self._build_dumps_tab(), "Dumps")
-        self._tabs.addTab(self._build_filters_tab(), "Filters")
+        # Kept as an attribute so the Sell tab's "Manage filters…" can reach it
+        # by identity rather than by an index that shifts when a tab is added.
+        self._filters_page = self._build_filters_tab()
+        self._tabs.addTab(self._filters_page, "Filters")
 
         layout = QVBoxLayout()
         layout.addLayout(self._build_server_bar())
@@ -666,6 +671,15 @@ class MerchantModeWindow(PluginWindow):
         self._items_table.verticalHeader().setVisible(False)
         self._items_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._items_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._items_table.setToolTip(
+            "Tick what you're selling. Right-click a row for filtering and "
+            "removal — the buttons above do the same thing."
+        )
+        # Right-click is where a merchant looking at a row of junk will reach
+        # first, and a feature you can only find by reading the button bar is a
+        # feature most people never find. Same actions, met halfway.
+        self._items_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._items_table.customContextMenuRequested.connect(self._on_items_context_menu)
         header = self._items_table.horizontalHeader()
         # Name and location are both free text and both worth reading, so they
         # share the slack; the fixed-shape columns take only what they need.
@@ -1742,6 +1756,165 @@ class MerchantModeWindow(PluginWindow):
                 )
             )
         return found
+
+    # --- right-click on the Sell table -------------------------------------
+    def _on_items_context_menu(self, point) -> None:
+        """Pop the row menu where the pointer is."""
+        self._select_row_at(point)
+        menu = self._items_menu()
+        if menu is not None:
+            menu.exec(self._items_table.viewport().mapToGlobal(point))
+
+    def _select_row_at(self, point) -> None:
+        """Make the row under ``point`` the selection, unless it already is.
+
+        A row the user right-clicked but had not selected becomes the selection
+        first, the way every table in every other application behaves —
+        otherwise the menu would act on some other row and the two gestures
+        would look unrelated. An existing multi-row selection is left alone,
+        which is what makes "select five, right-click one of them, filter them
+        all out" work.
+        """
+        row = self._items_table.rowAt(point.y())
+        if row < 0:
+            return
+        model = self._items_table.selectionModel()
+        if model is None or not model.isRowSelected(row):
+            self._items_table.selectRow(row)
+
+    def _items_menu(self) -> QMenu | None:
+        """The row menu, built from the current selection.
+
+        Split out from the event handler so it can be inspected and triggered
+        without a pointer — a menu that only exists inside ``exec()`` is a menu
+        no test can read.
+        """
+        chosen = self._selected_items()
+        if not chosen:
+            return None
+        names = sorted({name for name, _row in chosen})
+        menu = QMenu(self._items_table)
+        rules = self._plugin.filters()
+        already = [name for name in names if rules.hidden(name)]
+
+        # Offering to filter something already filtered is an entry that does
+        # nothing, on the one row where the useful action is the opposite one.
+        if len(already) < len(names):
+            if len(names) == 1:
+                # One row, one click, no dialog: the rule is reversible on the
+                # Filters tab and the status line reports the new hidden count,
+                # so a confirmation here would be friction protecting nothing.
+                filter_out = menu.addAction(f"Filter out “{names[0]}”")
+                filter_out.triggered.connect(lambda: self._filter_out_exactly(names))
+            else:
+                filter_out = menu.addAction(f"Filter out these {len(names)} items…")
+                filter_out.triggered.connect(self._on_filter_selected)
+
+            # The rule that catches a family rather than a name — "any bag",
+            # "any rusty anything" — which is the rule people actually want and
+            # the one they would never think to go and write.
+            pattern = menu.addAction("Filter out items containing…")
+            pattern.triggered.connect(lambda: self._filter_out_containing(names[0]))
+
+        caught = [rule for rule in (rules.reason(name) for name in already) if rule is not None]
+        if caught:
+            # Only reachable with "Show filtered" on. Being able to undo a rule
+            # from the row it is acting on is the other half of being able to
+            # write one there.
+            culprit = caught[0]
+            stop = menu.addAction(f"Stop filtering ({culprit.describe()})")
+            stop.triggered.connect(lambda: self._stop_filtering(culprit))
+
+        menu.addSeparator()
+        remove = menu.addAction(f"Remove {_plural(len(chosen), 'row')} from this dump…")
+        remove.triggered.connect(self._on_remove_items)
+
+        menu.addSeparator()
+        manage = menu.addAction("Manage filters…")
+        manage.triggered.connect(self._show_filters_tab)
+        return menu
+
+    def _show_filters_tab(self) -> None:
+        self._tabs.setCurrentWidget(self._filters_page)
+
+    def _filter_out_exactly(self, names: list[str]) -> None:
+        added = self._plugin.add_filters([FilterRule(name, Match.EXACT) for name in names])
+        self._reload()
+        if not added:
+            QMessageBox.information(self, "Merchant Mode", "That was already filtered.")
+
+    def _filter_out_containing(self, seed: str) -> None:
+        """Ask for the substring, offering the item's name as a starting point.
+
+        Prefilled and selected rather than blank: the useful rule is almost
+        always a word out of the name in front of you, and typing it back in
+        from memory is how a good idea becomes not worth the bother.
+        """
+        pattern, accepted = QInputDialog.getText(
+            self,
+            "Merchant Mode",
+            "Hide every item whose name contains:",
+            text=seed,
+        )
+        if not accepted or not pattern.strip():
+            return
+        rule = FilterRule(pattern.strip(), Match.CONTAINS)
+        catches = [
+            holding.name
+            for holding in self._plugin.holdings(
+                server=self._current_server(), include_filtered=True
+            )
+            if rule.hits(normalize(holding.name))
+        ]
+        if not catches:
+            QMessageBox.information(
+                self,
+                "Merchant Mode",
+                f"Nothing you're holding on this server matches “{pattern.strip()}”.\n\n"
+                "The rule would be added and do nothing — check the spelling.",
+            )
+            return
+        listed = "\n".join(f"  · {name}" for name in sorted(set(catches))[:8])
+        if len(set(catches)) > 8:
+            listed += f"\n  … and {len(set(catches)) - 8} more"
+        confirm = QMessageBox.question(
+            self,
+            "Merchant Mode",
+            f"Hide {_plural(len(catches), 'held item')} matching “{pattern.strip()}”?\n\n"
+            f"{listed}\n\n"
+            "Nothing is deleted, and future dumps are caught by the same rule. "
+            "Spare one of them with a Keep rule on the Filters tab.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._plugin.add_filters([rule])
+        self._reload()
+
+    def _stop_filtering(self, rule: FilterRule) -> None:
+        """Drop one rule, warning when it is hiding more than the row clicked."""
+        rules = self._plugin.filter_rules()
+        indices = [index for index, other in enumerate(rules) if other.identity == rule.identity]
+        if not indices:
+            return
+        also = [
+            holding.name
+            for holding in self._plugin.holdings(
+                server=self._current_server(), include_filtered=True
+            )
+            if rule.hits(normalize(holding.name))
+        ]
+        if len(set(also)) > 1:
+            confirm = QMessageBox.question(
+                self,
+                "Merchant Mode",
+                f"{rule.describe()}\n\n"
+                f"Removing it brings back {_plural(len(set(also)), 'item')} here, "
+                "not just this one.",
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+        self._plugin.remove_filters(indices)
+        self._reload()
 
     def _on_remove_items(self) -> None:
         """Drop the selected rows from the stored dump.

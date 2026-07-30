@@ -22,7 +22,13 @@ from nparseplus.config.settings import Settings
 from nparseplus_sdk.plugin import PluginWindowContext
 from nparseplus_sdk.testing import FakePluginContext
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QCheckBox, QMessageBox, QSpinBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QInputDialog,
+    QMessageBox,
+    QSpinBox,
+)
 
 from merchant_mode import MerchantModePlugin, create_plugin
 from merchant_mode.macros import Listing
@@ -428,3 +434,172 @@ def test_the_suggested_rules_are_offered_rather_than_applied(built) -> None:
     assert plugin.filter_rules() == []
     window._on_add_suggested_filters()
     assert len(plugin.filter_rules()) > 0
+
+
+# --- right-clicking a row ---------------------------------------------------
+#
+# The buttons and the menu are the same actions. The menu exists because
+# right-click is where somebody looking at a row of junk reaches first, and a
+# feature you can only find by reading the button bar is one most people never
+# find at all.
+
+
+def _menu_texts(window) -> list[str]:
+    menu = window._items_menu()
+    return [action.text() for action in menu.actions() if not action.isSeparator()]
+
+
+def _trigger(window, starts_with: str) -> None:
+    for action in window._items_menu().actions():
+        if action.text().startswith(starts_with):
+            action.trigger()
+            return
+    raise AssertionError(f"no menu entry starting {starts_with!r}")
+
+
+def test_no_menu_without_a_row(built) -> None:
+    _plugin, _ctx, window = built
+    window._items_table.clearSelection()
+    assert window._items_menu() is None
+
+
+def test_the_row_menu_offers_the_actions_for_one_item(built) -> None:
+    _plugin, _ctx, window = built
+    window._items_table.selectRow(_row_for(window, "Cloak of Flames"))
+    assert _menu_texts(window) == [
+        "Filter out “Cloak of Flames”",
+        "Filter out items containing…",
+        "Remove 1 row from this dump…",
+        "Manage filters…",
+    ]
+
+
+def test_the_row_menu_speaks_in_plural_for_a_multi_row_selection(built) -> None:
+    _plugin, _ctx, window = built
+    window._items_table.selectAll()
+    texts = _menu_texts(window)
+    assert texts[0] == "Filter out these 2 items…"
+    assert "Remove 2 rows from this dump…" in texts
+
+
+def test_filtering_one_row_from_the_menu_needs_no_dialog(built) -> None:
+    """One row, one click. The rule is reversible on the Filters tab and the
+    status line reports the new count, so a confirmation guards nothing."""
+    plugin, _ctx, window = built
+    window._items_table.selectRow(_row_for(window, "Fungus Covered Scale Tunic"))
+    _trigger(window, "Filter out “")
+
+    assert [rule.pattern for rule in plugin.filter_rules()] == ["Fungus Covered Scale Tunic"]
+    assert window._items_table.rowCount() == 1
+    assert "1 hidden by filters" in window._budget.text()
+
+
+def test_the_contains_rule_is_offered_prefilled_and_confirmed(built) -> None:
+    """The rule people actually want catches a family, not a name — and it is
+    the one they would never think to go and write."""
+    plugin, _ctx, window = built
+    window._items_table.selectRow(_row_for(window, "Cloak of Flames"))
+
+    seen: list = []
+
+    def prompt(*_args, text="", **_kw):
+        seen.append(text)
+        return "cloak", True
+
+    with patch.object(QInputDialog, "getText", side_effect=prompt), _confirmed():
+        _trigger(window, "Filter out items containing")
+
+    assert seen == ["Cloak of Flames"]  # prefilled from the row
+    assert [rule.pattern for rule in plugin.filter_rules()] == ["cloak"]
+    assert window._items_table.rowCount() == 1
+
+
+def test_a_contains_rule_that_catches_nothing_is_refused_rather_than_added(built) -> None:
+    """A rule added and doing nothing is a typo you find out about later."""
+    plugin, _ctx, window = built
+    window._items_table.selectRow(_row_for(window, "Cloak of Flames"))
+
+    with patch.object(QInputDialog, "getText", return_value=("qqq", True)), _dismissed() as shown:
+        _trigger(window, "Filter out items containing")
+    assert shown
+    assert plugin.filter_rules() == []
+
+
+def test_a_cancelled_contains_dialog_changes_nothing(built) -> None:
+    plugin, _ctx, window = built
+    window._items_table.selectRow(_row_for(window, "Cloak of Flames"))
+    with patch.object(QInputDialog, "getText", return_value=("cloak", False)):
+        _trigger(window, "Filter out items containing")
+    assert plugin.filter_rules() == []
+
+
+def test_a_filtered_row_offers_to_undo_the_rule_that_caught_it(built) -> None:
+    """The other half of being able to write a rule from the row."""
+    from merchant_mode.filters import FilterRule
+
+    plugin, _ctx, window = built
+    plugin.add_filters([FilterRule("fungus")])
+    window._show_filtered.setChecked(True)
+    window._items_table.selectRow(_row_for(window, "Fungus Covered Scale Tunic"))
+
+    texts = _menu_texts(window)
+    assert any(text.startswith("Stop filtering") for text in texts)
+    # ...and no offer to filter what is already filtered, which would be an
+    # entry doing nothing on the one row where the opposite is the useful move.
+    assert not any(text.startswith("Filter out") for text in texts)
+
+    _trigger(window, "Stop filtering")
+    assert plugin.filter_rules() == []
+
+
+def test_undoing_a_rule_that_frees_more_than_one_row_asks_first(built) -> None:
+    from merchant_mode.filters import FilterRule
+
+    plugin, _ctx, window = built
+    plugin.add_filters([FilterRule("o")])  # catches both fixture items
+    window._show_filtered.setChecked(True)
+    window._items_table.selectRow(0)
+
+    with patch.object(
+        QMessageBox, "question", return_value=QMessageBox.StandardButton.No
+    ) as asked:
+        _trigger(window, "Stop filtering")
+    assert asked.called
+    assert len(plugin.filter_rules()) == 1  # declined, so nothing changed
+
+
+def test_manage_filters_opens_the_tab_it_names(built) -> None:
+    _plugin, _ctx, window = built
+    window._items_table.selectRow(0)
+    _trigger(window, "Manage filters")
+    assert window._tabs.tabText(window._tabs.currentIndex()) == "Filters"
+
+
+def test_right_clicking_an_unselected_row_selects_it_first(built) -> None:
+    """Otherwise the menu acts on some other row and the two gestures look
+    unrelated."""
+    _plugin, _ctx, window = built
+    table = window._items_table
+    table.resize(600, 300)  # laid out, not shown: PluginWindow.show() is modal-ish
+    QApplication.processEvents()
+    table.clearSelection()
+
+    row = _row_for(window, "Fungus Covered Scale Tunic")
+    # The handler itself only adds menu.exec(), which needs a live pointer.
+    window._select_row_at(table.visualItemRect(table.item(row, 1)).center())
+
+    assert [name for name, _row in window._selected_items()] == ["Fungus Covered Scale Tunic"]
+
+
+def test_right_clicking_inside_a_selection_leaves_it_alone(built) -> None:
+    """"Select five, right-click one of them, filter them all out" — the whole
+    reason the menu is worth having over a per-row button."""
+    _plugin, _ctx, window = built
+    table = window._items_table
+    table.resize(600, 300)
+    QApplication.processEvents()
+    table.selectAll()
+
+    window._select_row_at(table.visualItemRect(table.item(0, 1)).center())
+    assert len(window._selected_items()) == 2
+
