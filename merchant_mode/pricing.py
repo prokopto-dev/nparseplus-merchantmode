@@ -98,31 +98,42 @@ def suggest(
     averages: dict[str, int] | None = None,
     side: Side = Side.SELL,
     min_samples: int = 1,
+    matcher=None,
 ) -> Suggestion:
     """Best known price for ``name``, with provenance.
 
     Order: the median of matching-side auctions, then the median of the other
     side, then the PigParse average. ``min_samples`` raises the bar for
     trusting live data — a single optimistic auction is not a market.
+
+    ``matcher`` is a :class:`~merchant_mode.matching.NameMatcher`. Without one,
+    both lookups demand the exact spelling, which is why this used to come back
+    empty for items the channel had been pricing all evening.
     """
     if history is not None:
-        matching = history.prices_for(name, wanted=side.wanted)
+        matching = history.prices_for(name, wanted=side.wanted, matcher=matcher)
         if len(matching) >= min_samples:
             return Suggestion(
-                price=history.median(name, wanted=side.wanted),
+                price=history.median(name, wanted=side.wanted, matcher=matcher),
                 source=PriceSource.OBSERVED,
                 samples=len(matching),
             )
-        opposite = history.prices_for(name, wanted=not side.wanted)
+        opposite = history.prices_for(name, wanted=not side.wanted, matcher=matcher)
         if len(opposite) >= min_samples:
             return Suggestion(
-                price=history.median(name, wanted=not side.wanted),
+                price=history.median(name, wanted=not side.wanted, matcher=matcher),
                 source=PriceSource.OBSERVED_OPPOSITE,
                 samples=len(opposite),
             )
 
     if averages:
+        # PigParse answers under its own spelling, so try the canonical name
+        # too — the average was very likely stored under that one.
         average = averages.get(name.strip().casefold())
+        if not average and matcher is not None:
+            resolved = matcher.resolve(name)
+            if resolved is not None:
+                average = averages.get(resolved.strip().casefold())
         if average and average > 0:
             return Suggestion(price=int(average), source=PriceSource.PIGPARSE)
 

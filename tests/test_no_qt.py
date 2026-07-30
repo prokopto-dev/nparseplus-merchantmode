@@ -24,9 +24,14 @@ QT_FREE_MODULES = [
     "merchant_mode.catalog",
     "merchant_mode.inventory",
     "merchant_mode.itemlink",
+    "merchant_mode.itemnames",
     "merchant_mode.macros",
+    "merchant_mode.market",
+    "merchant_mode.matching",
     "merchant_mode.nicknames",
     "merchant_mode.packing",
+    "merchant_mode.pricing",
+    "merchant_mode.servers",
     "merchant_mode.socialpack",
 ]
 

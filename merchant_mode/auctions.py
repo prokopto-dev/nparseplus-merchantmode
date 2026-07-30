@@ -94,6 +94,18 @@ def _offers(body: str) -> list[Offer]:
     return offers
 
 
+def _is(observed: str, wanted_name: str, matcher=None) -> bool:
+    """Whether an observed auction name refers to ``wanted_name``.
+
+    Kept as a free function so ``PriceHistory`` stays unaware of
+    :mod:`merchant_mode.matching` — this module is the lower layer of the two
+    and importing upward would make the dependency a cycle.
+    """
+    if matcher is not None:
+        return bool(matcher.same(observed, wanted_name))
+    return observed.strip().casefold() == wanted_name.strip().casefold()
+
+
 def parse_auction(content: str) -> tuple[list[Offer], list[Offer]]:
     """Split an auction line into ``(selling, buying)``.
 
@@ -155,13 +167,19 @@ class PriceHistory:
                 added.append(observation)
         return added
 
-    def recent(self, name: str | None = None, *, limit: int = 50) -> list[Observation]:
-        """Newest first, optionally filtered to one item name."""
+    def recent(
+        self, name: str | None = None, *, limit: int = 50, matcher=None
+    ) -> list[Observation]:
+        """Newest first, optionally filtered to one item name.
+
+        ``matcher`` is a :class:`~merchant_mode.matching.NameMatcher`; with one,
+        the filter follows nicknames and typos instead of demanding the exact
+        spelling the seller happened to use.
+        """
         if name is None:
             selected = list(self._items)
         else:
-            key = name.strip().casefold()
-            selected = [item for item in self._items if item.name.casefold() == key]
+            selected = [item for item in self._items if _is(item.name, name, matcher)]
         return list(reversed(selected))[:limit]
 
     def names(self) -> list[str]:
@@ -171,30 +189,35 @@ class PriceHistory:
             seen.setdefault(item.name.casefold(), item.name)
         return list(seen.values())
 
-    def prices_for(self, name: str, *, wanted: bool = False) -> list[int]:
-        """Every observed price for ``name`` on one side of the trade."""
-        key = name.strip().casefold()
+    def prices_for(self, name: str, *, wanted: bool = False, matcher=None) -> list[int]:
+        """Every observed price for ``name`` on one side of the trade.
+
+        Without a ``matcher`` this is exact case-folded equality, which for
+        real inventory names almost never fires — the channel writes ``fungi``,
+        your dump says ``Fungus Covered Scale Tunic``. Pass a
+        :class:`~merchant_mode.matching.NameMatcher` and the two meet.
+        """
         return [
             item.price
             for item in self._items
-            if item.name.casefold() == key and item.wanted == wanted
+            if item.wanted == wanted and _is(item.name, name, matcher)
         ]
 
-    def average(self, name: str, *, wanted: bool = False) -> int | None:
+    def average(self, name: str, *, wanted: bool = False, matcher=None) -> int | None:
         """Mean observed price for ``name``, or ``None`` if never seen."""
-        prices = self.prices_for(name, wanted=wanted)
+        prices = self.prices_for(name, wanted=wanted, matcher=matcher)
         if not prices:
             return None
         return round(sum(prices) / len(prices))
 
-    def median(self, name: str, *, wanted: bool = False) -> int | None:
+    def median(self, name: str, *, wanted: bool = False, matcher=None) -> int | None:
         """Median observed price, or ``None`` if never seen.
 
         Preferred over the mean for suggesting a price: one optimist asking
         10x the going rate drags a mean somewhere useless, and in a channel
         where people routinely fish for a bite that is not a rare event.
         """
-        prices = self.prices_for(name, wanted=wanted)
+        prices = self.prices_for(name, wanted=wanted, matcher=matcher)
         if not prices:
             return None
         return round(statistics.median(prices))
