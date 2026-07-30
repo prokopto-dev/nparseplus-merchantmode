@@ -103,6 +103,7 @@ def test_every_readme_shot_still_has_a_recipe() -> None:
         "window--buy",
         "window--market",
         "window--dumps",
+        "window--filters",
         "settings--merchant-mode",
     }
 
@@ -126,3 +127,30 @@ def test_the_find_shot_spans_two_characters_with_one_stale(tmp_path) -> None:
     found = plugin.find_holdings("long sword")
     assert {match.character for match in found} == {"Xantik", "Mulebank"}
     assert [match.is_stale(cap.NOW) for match in found].count(True) == 1
+
+
+def test_the_filters_shot_shows_a_rule_of_each_kind(tmp_path) -> None:
+    """The Filters shot's argument is that exceptions and typos both show.
+
+    A broad rule catching junk, a KEEP sparing the one bag worth selling, and a
+    rule matching nothing: if the seed stopped producing all three, the README
+    would keep claiming the tab tells them apart.
+    """
+    plugin, _ctx = cap.build_plugin(tmp_path / "seed")
+    rules = plugin.filters()
+    assert rules.hidden("Large Bag")
+    assert not rules.hidden("Bag of the Tinkerers")  # the KEEP exception
+    assert plugin.hidden_count() > 0
+    held = {holding.name for holding in plugin.holdings(include_filtered=True)}
+    assert not any(rule.hits(cap_normalize(name)) for name in held for rule in _dead_rules(plugin))
+
+
+def _dead_rules(plugin):
+    """Rules the seed deliberately includes that catch nothing right now."""
+    return [rule for rule in plugin.filter_rules() if rule.pattern == "Spiderling Silk"]
+
+
+def cap_normalize(name: str) -> str:
+    from merchant_mode.matching import normalize
+
+    return normalize(name)

@@ -109,6 +109,16 @@ WANTED = [
     "Circlet of Shadow",
 ]
 
+# Filter rules for the Filters shot, chosen to show all three states at once:
+# a broad rule catching real junk, the exception that spares the one bag worth
+# selling, and a rule that catches nothing — which is what a typo looks like.
+FILTERS = [
+    ("bag", "contains", "hide"),
+    ("Bag of the Tinkerers", "exact", "keep"),
+    ("Rusty", "prefix", "hide"),
+    ("Spiderling Silk", "exact", "hide"),
+]
+
 # Auction lines the plugin will parse into its price history, newest last.
 #
 # Cloak of Flames gets an evening's worth on purpose: it is the item the Market
@@ -201,6 +211,7 @@ def build_plugin(tmp_dir: Path):
     from nparseplus_sdk.testing import FakePluginContext
 
     from merchant_mode import MerchantModePlugin, create_plugin
+    from merchant_mode.filters import Action, FilterRule, Match
     from merchant_mode.macros import Listing
 
     ctx = FakePluginContext(MerchantModePlugin.meta)
@@ -222,6 +233,12 @@ def build_plugin(tmp_dir: Path):
         ]
     )
     plugin.set_wanted(WANTED)
+    plugin.add_filters(
+        [
+            FilterRule(pattern, Match(match), Action(action))
+            for pattern, match, action in FILTERS
+        ]
+    )
 
     # Spread over an evening rather than a minute apart: the price chart plots
     # these against time, and nine sightings inside ten minutes draws a vertical
@@ -320,12 +337,26 @@ def cap_dumps(window, name: str = "window--dumps") -> Path:
     return capture(window, name, size=WINDOW_SIZE)
 
 
+def cap_filters(window, name: str = "window--filters") -> Path:
+    """The Filters tab with rules that actually catch something.
+
+    The seed adds three: a broad one, the exception that spares the bag worth
+    selling, and one that matches nothing — the three states the Hiding column
+    exists to tell apart.
+    """
+    window._tabs.setCurrentIndex(5)
+    window._rendered_version = -1
+    window.refresh()
+    return capture(window, name, size=WINDOW_SIZE)
+
+
 SHOTS = {
     "window--sell": lambda w, c: cap_tab(w, 0, "window--sell"),
     "window--find": lambda w, c: cap_find(w),
     "window--buy": lambda w, c: cap_tab(w, 2, "window--buy"),
     "window--market": lambda w, c: cap_market(w),
     "window--dumps": lambda w, c: cap_dumps(w),
+    "window--filters": lambda w, c: cap_filters(w),
     "settings--merchant-mode": lambda w, c: cap_settings(c),
 }
 
