@@ -1,0 +1,55 @@
+# Packaging metadata for developing and testing the plugin. Note: end users
+# do NOT pip-install plugins — they install the release zip through nParse+.
+# This file exists for your dev environment, CI, and (optionally) pip-based
+# discovery for people who run nParse+ from source.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nparseplus-merchantmode"
+version = "0.0.0"  # informational; the version that matters is PluginMeta.version
+description = "Merchant Mode for nParse+ — inventory to linkable WTS auction macros."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.12"
+dependencies = [
+  # NOTE: `nparseplus-sdk` is not on PyPI yet, so this installs it from the
+  # app repo's `sdk/` subdirectory. ONCE `nparseplus-sdk` IS PUBLISHED,
+  # replace this line with the plain requirement:
+  #     "nparseplus-sdk>=1.0,<2",
+  # and do the same in .github/workflows/ci.yml and release.yml.
+  "nparseplus-sdk @ git+https://github.com/prokopto-dev/nparse-plus@master#subdirectory=sdk",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2",
+  # Optional: full validation (the lazy host re-exports in
+  # nparseplus_sdk.events / .timers, live runs) needs the app itself. This
+  # plugin must still pass its tests WITHOUT it — CI installs the SDK only.
+  "nparseplus @ git+https://github.com/prokopto-dev/nparse-plus@master",
+]
+
+# Optional: lets source-install nParse+ users discover this plugin via pip.
+# The release zip remains the way everyone else installs it.
+[project.entry-points."nparseplus.plugins"]
+merchant-mode = "merchant_mode:create_plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["merchant_mode"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["merchant_mode", "tests"]
+
+# Mirrors the host app's selection so this repo lints the same way nParse+ does.
+# Notably absent: DTZ. Timestamps here are naive local datetimes throughout,
+# matching the log's own clock and the host's pipeline-wide invariant.
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["merchant_mode"]

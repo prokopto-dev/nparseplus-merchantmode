@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  # Rename this when you rename the plugin package directory.
+  PLUGIN_DIR: merchant_mode
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install SDK + test deps
+        run: |
+          # NOTE: `nparseplus-sdk` is not on PyPI yet, so it comes from the
+          # app repo's `sdk/` subdirectory. Once it IS published, replace the
+          # line below with: python -m pip install "nparseplus-sdk>=1.0,<2"
+          python -m pip install "nparseplus-sdk @ git+https://github.com/prokopto-dev/nparse-plus@master#subdirectory=sdk"
+          python -m pip install pytest
+      # Deliberately SDK-only: nParse+ itself is not installed here, so the
+      # lazy host re-exports (nparseplus_sdk.events/.timers) raise ImportError.
+      # Your plugin must degrade gracefully rather than fail to register.
+      - name: Unit tests (FakePluginContext)
+        run: python -m pytest -q
+      - name: Validate plugin (load-correctness + advisory scan)
+        run: nparseplus-plugin validate "$PLUGIN_DIR"
