@@ -480,7 +480,7 @@ def test_saving_stamps_the_current_schema_version() -> None:
 
     plugin, ctx = _activated()
     plugin.set_wanted(["Manastone"])
-    assert ctx.storage.data["schema_version"] == SCHEMA_VERSION == 3
+    assert ctx.storage.data["schema_version"] == SCHEMA_VERSION == 4
 
 
 def test_inventories_survive_a_restart(tmp_path) -> None:
@@ -720,3 +720,161 @@ def test_v2_averages_survive_the_upgrade_to_v3() -> None:
     assert plugin.market_for("Cloak of Flames").headline == 5000
     assert plugin.fill_prices() == 1
     assert plugin.snapshot()["listings"][0].price == "5k"
+
+
+# --- finding, dump ages, and charts ----------------------------------------
+#
+# Three questions the plugin could not answer before v0.3.0: where an item is
+# when the buyer half-remembers its name, how old the answer is, and whether
+# the price behind it is moving.
+
+
+def test_find_holdings_answers_a_half_remembered_name(tmp_path) -> None:
+    plugin, _ = _activated()
+    plugin.load_dump(_dump(tmp_path, "Mulebank", MULE_DUMP), server="green")
+
+    found = plugin.find_holdings("rubicite breast")
+    assert [match.name for match in found] == ["Rubicite Breastplate"]
+    assert found[0].character == "Mulebank"
+
+
+def test_find_holdings_crosses_servers_where_the_sell_tab_does_not(tmp_path) -> None:
+    """"Is it anywhere on the account" is a different question to "can I sell it"."""
+    plugin, _ = _activated()
+    plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server="green")
+    plugin.load_dump(_dump(tmp_path, "Mulebank", MULE_DUMP), server="blue")
+
+    assert {match.server for match in plugin.find_holdings("manastone")} == {"blue"}
+    assert plugin.holdings(server="green") and not [
+        holding for holding in plugin.holdings(server="green") if holding.name == "Manastone"
+    ]
+
+
+def test_find_holdings_follows_a_nickname(tmp_path) -> None:
+    plugin, _ = _activated()
+    plugin.load_dump(_dump(tmp_path, "Mulebank", MULE_DUMP), server="green")
+    plugin.nicknames().set("Rubicite Breastplate", "rubi")
+
+    assert [match.name for match in plugin.find_holdings("rubi")] == ["Rubicite Breastplate"]
+
+
+def test_a_dump_remembers_the_file_it_came_from(tmp_path) -> None:
+    plugin, _ = _activated()
+    path = _dump(tmp_path, "Mulebank", MULE_DUMP)
+    plugin.load_dump(path, server="green")
+    assert plugin.inventories()[0].source_path == str(path)
+
+
+def test_reloading_re_reads_the_same_file_without_a_dialog(tmp_path) -> None:
+    plugin, _ = _activated()
+    path = _dump(tmp_path, "Mulebank", MULE_DUMP)
+    plugin.load_dump(path, server="green")
+
+    path.write_text(
+        "\n".join(
+            (
+                "Location\tName\tID\tCount\tSlots",
+                "General1-Slot1\tManastone\t4567\t1\t0",
+            )
+        ),
+        encoding="utf-8",
+    )
+    assert plugin.reload_dump("Mulebank", "green") == 1
+    assert {holding.name for holding in plugin.holdings()} == {"Manastone"}
+
+
+def test_reloading_a_dump_with_no_remembered_path_reports_failure() -> None:
+    """A v3 store has no paths; the caller has to fall back to the dialog."""
+    plugin, _ = _activated()
+    assert plugin.reload_dump("Nobody", "green") == 0
+
+
+def test_forgetting_names_the_unfiled_bucket_explicitly(tmp_path) -> None:
+    """``""`` is a real server bucket, not "unspecified" — see forget_character."""
+    plugin, _ = _activated()
+    plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server="green")
+    plugin.load_dump(_dump(tmp_path, "Mulebank", MULE_DUMP), server="green")
+    plugin.set_server("green")
+
+    plugin.forget_character("Mulebank", "green")
+    assert [record.character for record in plugin.inventories()] == ["Xantik"]
+
+
+def test_the_staleness_threshold_is_a_setting(tmp_path) -> None:
+    import os
+
+    plugin, _ = _activated()
+    path = _dump(tmp_path, "Mulebank", MULE_DUMP)
+    stamp = (datetime.now() - timedelta(days=3)).timestamp()
+    os.utime(path, (stamp, stamp))
+    plugin.load_dump(path, server="green")
+
+    assert plugin.stale_dumps() == []  # three days old, default threshold is seven
+    plugin.apply_settings({"stale_days": 2})
+    assert [record.character for record in plugin.stale_dumps()] == ["Mulebank"]
+
+
+def test_the_staleness_threshold_is_clamped_to_something_useful() -> None:
+    plugin, _ = _activated()
+    plugin.apply_settings({"stale_days": 0})
+    assert plugin.settings()["stale_days"] == 1
+    plugin.apply_settings({"stale_days": 9999})
+    assert plugin.settings()["stale_days"] == 90
+    assert plugin.stale_after() == timedelta(days=90)
+
+
+def test_the_staleness_threshold_survives_a_restart() -> None:
+    plugin, ctx = _activated()
+    plugin.apply_settings({"stale_days": 3})
+    plugin.deactivate()
+
+    restored = create_plugin()
+    restored.activate(FakePluginContext(MerchantModePlugin.meta, storage=ctx.storage))
+    assert restored.settings()["stale_days"] == 3
+
+
+def test_chart_for_pulls_pigparse_and_the_live_feed_together() -> None:
+    plugin, _ = _activated()
+    plugin._apply_prices([_FakeItemPrice("Cloak of Flames", 11621, 5000, samples=40)])
+    plugin.observe_auction("WTS Cloak of Flames 6k", timestamp=T0, sender="Someone")
+
+    chart = plugin.chart_for("Cloak of Flames")
+    assert chart.has_windows
+    assert chart.has_observations
+    assert chart.baseline == plugin.market_for("Cloak of Flames").headline
+    assert chart.sell.median == 6000
+
+
+def test_chart_for_an_unknown_item_is_empty_rather_than_absent() -> None:
+    """The panel needs something to draw an empty state from."""
+    plugin, _ = _activated()
+    chart = plugin.chart_for("Circlet of Shadow")
+    assert chart.empty
+    assert chart.name == "Circlet of Shadow"
+
+
+def test_reloading_an_unfiled_dump_leaves_it_unfiled(tmp_path) -> None:
+    """A reload re-reads a file; it does not re-decide which server it's on.
+
+    Routing this through load_dump would refile an unfiled dump under whatever
+    server is current, stranding the original row under a key nothing points at.
+    """
+    plugin, _ = _activated()
+    path = _dump(tmp_path, "Mulebank", MULE_DUMP)
+    plugin.load_dump(path, server="")  # no server anywhere: the unfiled bucket
+    assert plugin.dumped_servers() == [""]
+
+    plugin.set_server("green")  # ...and now one is current
+    assert plugin.reload_dump("Mulebank", "") == 2
+    assert plugin.dumped_servers() == [""]
+    assert len(plugin.inventories()) == 1
+
+
+def test_reloading_a_dump_whose_file_vanished_reports_failure(tmp_path) -> None:
+    plugin, _ = _activated()
+    path = _dump(tmp_path, "Mulebank", MULE_DUMP)
+    plugin.load_dump(path, server="green")
+    path.unlink()
+    assert plugin.reload_dump("Mulebank", "green") == 0
+    # The dump it already has is still there — a failed reload loses nothing.
+    assert len(plugin.holdings()) == 2
