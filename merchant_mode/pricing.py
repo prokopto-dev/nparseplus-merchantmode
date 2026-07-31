@@ -99,6 +99,7 @@ def suggest(
     side: Side = Side.SELL,
     min_samples: int = 1,
     matcher=None,
+    server: str | None = None,
 ) -> Suggestion:
     """Best known price for ``name``, with provenance.
 
@@ -109,19 +110,24 @@ def suggest(
     ``matcher`` is a :class:`~merchant_mode.matching.NameMatcher`. Without one,
     both lookups demand the exact spelling, which is why this used to come back
     empty for items the channel had been pricing all evening.
+
+    ``server`` narrows the live half to one server's channel; ``averages`` is
+    expected to have been narrowed by the caller already. A price is only ever
+    an answer about one server, since that is the only place the item can
+    change hands.
     """
     if history is not None:
-        matching = history.prices_for(name, wanted=side.wanted, matcher=matcher)
+        matching = history.prices_for(name, wanted=side.wanted, matcher=matcher, server=server)
         if len(matching) >= min_samples:
             return Suggestion(
-                price=history.median(name, wanted=side.wanted, matcher=matcher),
+                price=history.median(name, wanted=side.wanted, matcher=matcher, server=server),
                 source=PriceSource.OBSERVED,
                 samples=len(matching),
             )
-        opposite = history.prices_for(name, wanted=not side.wanted, matcher=matcher)
+        opposite = history.prices_for(name, wanted=not side.wanted, matcher=matcher, server=server)
         if len(opposite) >= min_samples:
             return Suggestion(
-                price=history.median(name, wanted=not side.wanted, matcher=matcher),
+                price=history.median(name, wanted=not side.wanted, matcher=matcher, server=server),
                 source=PriceSource.OBSERVED_OPPOSITE,
                 samples=len(opposite),
             )

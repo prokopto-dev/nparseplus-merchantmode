@@ -273,6 +273,33 @@ class InventoryVault:
     def drop(self, character: str, server: str) -> None:
         self._by_key.pop(inventory_key(character, server), None)
 
+    def remove_items(self, character: str, server: str, rows: set[tuple[str, int]]) -> int:
+        """Drop individual rows from one character's dump. Returns how many.
+
+        ``rows`` are ``(location_key, item_id)`` pairs — the location is what
+        distinguishes two stacks of the same item in different bags, and the id
+        is what stops a renamed row being matched by position alone.
+
+        This edits the *record*, not the file. A dump is a photograph and this
+        is cropping it: the next reload re-reads the file and the rows come
+        back, which is the honest behaviour and the reason
+        :mod:`merchant_mode.filters` exists for anything you want gone for good.
+        """
+        record = self._by_key.get(inventory_key(character, server))
+        if record is None or not rows:
+            return 0
+        kept = [item for item in record.items if (item.location_key, item.item_id) not in rows]
+        removed = len(record.items) - len(kept)
+        if removed:
+            self._by_key[record.key] = CharacterInventory(
+                character=record.character,
+                server=record.server,
+                captured_at=record.captured_at,
+                items=kept,
+                source_path=record.source_path,
+            )
+        return removed
+
     def characters(self) -> list[CharacterInventory]:
         """Every recorded dump, most recently captured first."""
         return sorted(self._by_key.values(), key=lambda r: r.captured_at, reverse=True)

@@ -58,6 +58,13 @@ class Observation:
     sender: str = ""
     wanted: bool = False
     """True for WTB, false for WTS."""
+    server: str = ""
+    """Which server the channel was on when this was heard.
+
+    Carried rather than assumed because the history outlives the session: an
+    evening on Blue and an evening on Green land in the same deque, and a Blue
+    ask is not evidence about a Green price. ``""`` means the server wasn't
+    known — pre-v5 history, or a session with no player yet."""
 
 
 def parse_price(text: str) -> int | None:
@@ -136,6 +143,12 @@ class PriceHistory:
 
     Bounded on purpose: this is a feel for the going rate, not a market
     database, and it rides along in the plugin's JSON storage.
+
+    Every read takes an optional ``server``. ``None`` means "everything heard",
+    which is what a diagnostic wants; a key — including ``""`` — means that
+    server alone, which is what every pricing question wants. The two are kept
+    distinct rather than collapsed because an item cannot be sold across
+    servers, so a Blue ask is not evidence about a Green price.
     """
 
     def __init__(self, observations: list[Observation] | None = None, *, limit: int = MAX_HISTORY):
@@ -148,6 +161,7 @@ class PriceHistory:
         *,
         timestamp: datetime,
         sender: str = "",
+        server: str = "",
     ) -> list[Observation]:
         """Parse one auction line and keep whatever carried a price."""
         selling, buying = parse_auction(content)
@@ -162,34 +176,41 @@ class PriceHistory:
                     price=offer.price,
                     sender=sender,
                     wanted=wanted,
+                    server=server,
                 )
                 self._items.append(observation)
                 added.append(observation)
         return added
 
+    def _on(self, server: str | None) -> list[Observation]:
+        if server is None:
+            return list(self._items)
+        return [item for item in self._items if item.server == server]
+
     def recent(
-        self, name: str | None = None, *, limit: int = 50, matcher=None
+        self, name: str | None = None, *, limit: int = 50, matcher=None, server: str | None = None
     ) -> list[Observation]:
-        """Newest first, optionally filtered to one item name.
+        """Newest first, optionally filtered to one item name and one server.
 
         ``matcher`` is a :class:`~merchant_mode.matching.NameMatcher`; with one,
         the filter follows nicknames and typos instead of demanding the exact
         spelling the seller happened to use.
         """
-        if name is None:
-            selected = list(self._items)
-        else:
-            selected = [item for item in self._items if _is(item.name, name, matcher)]
+        selected = self._on(server)
+        if name is not None:
+            selected = [item for item in selected if _is(item.name, name, matcher)]
         return list(reversed(selected))[:limit]
 
-    def names(self) -> list[str]:
+    def names(self, *, server: str | None = None) -> list[str]:
         """Distinct item names seen, newest first, case-insensitively deduped."""
         seen: dict[str, str] = {}
-        for item in reversed(self._items):
+        for item in reversed(self._on(server)):
             seen.setdefault(item.name.casefold(), item.name)
         return list(seen.values())
 
-    def prices_for(self, name: str, *, wanted: bool = False, matcher=None) -> list[int]:
+    def prices_for(
+        self, name: str, *, wanted: bool = False, matcher=None, server: str | None = None
+    ) -> list[int]:
         """Every observed price for ``name`` on one side of the trade.
 
         Without a ``matcher`` this is exact case-folded equality, which for
@@ -199,28 +220,40 @@ class PriceHistory:
         """
         return [
             item.price
-            for item in self._items
+            for item in self._on(server)
             if item.wanted == wanted and _is(item.name, name, matcher)
         ]
 
-    def average(self, name: str, *, wanted: bool = False, matcher=None) -> int | None:
+    def average(
+        self, name: str, *, wanted: bool = False, matcher=None, server: str | None = None
+    ) -> int | None:
         """Mean observed price for ``name``, or ``None`` if never seen."""
-        prices = self.prices_for(name, wanted=wanted, matcher=matcher)
+        prices = self.prices_for(name, wanted=wanted, matcher=matcher, server=server)
         if not prices:
             return None
         return round(sum(prices) / len(prices))
 
-    def median(self, name: str, *, wanted: bool = False, matcher=None) -> int | None:
+    def median(
+        self, name: str, *, wanted: bool = False, matcher=None, server: str | None = None
+    ) -> int | None:
         """Median observed price, or ``None`` if never seen.
 
         Preferred over the mean for suggesting a price: one optimist asking
         10x the going rate drags a mean somewhere useless, and in a channel
         where people routinely fish for a bite that is not a rare event.
         """
-        prices = self.prices_for(name, wanted=wanted, matcher=matcher)
+        prices = self.prices_for(name, wanted=wanted, matcher=matcher, server=server)
         if not prices:
             return None
         return round(statistics.median(prices))
+
+    def servers(self) -> list[str]:
+        """Server keys anything has been heard on, most recent first."""
+        seen: list[str] = []
+        for item in reversed(self._items):
+            if item.server not in seen:
+                seen.append(item.server)
+        return seen
 
     def to_list(self) -> list[dict]:
         return [
@@ -230,13 +263,23 @@ class PriceHistory:
                 "price": item.price,
                 "sender": item.sender,
                 "wanted": item.wanted,
+                "server": item.server,
             }
             for item in self._items
         ]
 
     @classmethod
-    def from_list(cls, data: object, *, limit: int = MAX_HISTORY) -> PriceHistory:
-        """Rebuild from storage, skipping anything malformed."""
+    def from_list(
+        cls, data: object, *, limit: int = MAX_HISTORY, default_server: str = ""
+    ) -> PriceHistory:
+        """Rebuild from storage, skipping anything malformed.
+
+        ``default_server`` is what a row with no server of its own is stamped
+        with. Pre-v5 storage has none, and the plugin only tracked one server
+        at a time back then — so the server it remembers is the one that
+        history was heard on, and stamping it is what stops an upgrade from
+        silently emptying a merchant's price history.
+        """
         observations: list[Observation] = []
         if isinstance(data, list):
             for row in data:
@@ -250,6 +293,7 @@ class PriceHistory:
                             price=int(row["price"]),
                             sender=str(row.get("sender", "")),
                             wanted=bool(row.get("wanted", False)),
+                            server=str(row.get("server", default_server) or ""),
                         )
                     )
                 except (KeyError, TypeError, ValueError):

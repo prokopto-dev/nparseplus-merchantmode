@@ -6,14 +6,22 @@ domain logic never imports PySide6. The window reads plugin state through
 against a version counter, so the driver thread and the GUI thread never share
 a mutable object.
 
-Five tabs: **Sell** (what you own, scoped to one server and character),
-**Find** (which mule is holding a thing, across every server), **Buy** (what
-you're looking for), **Market** (what anything is worth, and how that's
-moving), and **Dumps** (how old everything you're being told actually is).
+One server picker sits above the tabs and scopes all of them, because items
+cannot move between P99 servers: what you can list, what it is worth, what the
+channel said about it and which mule is holding it are all questions about one
+server, and a window where two tabs disagreed about which one would be a window
+that quietly built the wrong macro.
+
+Six tabs: **Sell** (what you own, by character), **Find** (which mule is
+holding a thing), **Buy** (what you're looking for), **Market** (what anything
+is worth, and how that's moving), **Dumps** (how old everything you're being
+told actually is, across every server — the one deliberate exception), and
+**Filters** (the items you never want to see again).
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -31,9 +39,11 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSizePolicy,
@@ -48,10 +58,12 @@ from PySide6.QtWidgets import (
 
 from .catalog import IdStatus
 from .chartdata import PriceChart
+from .filters import SUGGESTED_RULES, Action, FilterRule, Match
 from .inventory import character_from_filename
 from .itemlink import raw_len
 from .macros import Listing
 from .market import WINDOWS
+from .matching import normalize
 from .packing import LINE_LIMIT
 from .pricing import Side, format_price
 from .servers import SERVERS, label_for, normalize_key
@@ -70,6 +82,16 @@ ALL_CHARACTERS = "All characters"
 """Sentinel row in the character picker. There is deliberately no equivalent
 for servers: items on different servers can't be sold to the same buyer, so an
 all-servers list is one you'd have to mentally re-filter on every read."""
+
+CONFLICT_MARK = " ⚠"
+"""Appended to an item's name when its id is disputed.
+
+The Sell tab used to carry a whole ID column to say this, and forty rows of
+"owned" is forty rows of nothing — the id itself is a number you never type and
+never read. What is worth knowing is the one case where the sources disagree,
+because a wrong id fails *silently*: the link shows the right name and only
+opens the wrong item when the buyer clicks it. So the exception gets a mark and
+a tooltip, and the column is off unless you ask for it in settings."""
 
 UNKNOWN_SERVER = "Unfiled (no server)"
 """Label for dumps that carry no server — v2 storage, or a dump loaded before
@@ -524,8 +546,9 @@ class MerchantModeWindow(PluginWindow):
         self._rendered_version = -1
         self._detail_name = ""
         self._scope: str | None = None
-        """Server the Sell tab is showing. ``None`` follows the plugin; ``""``
-        is the unfiled bucket, which is why this can't just be a plain string."""
+        """Server the whole window is showing. ``None`` follows the plugin;
+        ``""`` is the unfiled bucket, which is why this can't just be a plain
+        string."""
 
         self._tabs = QTabWidget(self)
         self._tabs.addTab(self._build_sell_tab(), "Sell")
@@ -533,8 +556,13 @@ class MerchantModeWindow(PluginWindow):
         self._tabs.addTab(self._build_buy_tab(), "Buy")
         self._tabs.addTab(self._build_market_tab(), "Market")
         self._tabs.addTab(self._build_dumps_tab(), "Dumps")
+        # Kept as an attribute so the Sell tab's "Manage filters…" can reach it
+        # by identity rather than by an index that shifts when a tab is added.
+        self._filters_page = self._build_filters_tab()
+        self._tabs.addTab(self._filters_page, "Filters")
 
         layout = QVBoxLayout()
+        layout.addLayout(self._build_server_bar())
         layout.addWidget(self._tabs)
         self.setLayout(layout)
 
@@ -546,26 +574,45 @@ class MerchantModeWindow(PluginWindow):
         self.restore_visibility()
 
     # --- construction ------------------------------------------------------
-    def _build_sell_tab(self) -> QWidget:
-        page = QWidget(self)
+    def _build_server_bar(self) -> QHBoxLayout:
+        """The one control that scopes the whole window.
 
-        # Server first, then character: the server decides which prices apply
-        # and which characters even exist, so it can't be the inner scope.
-        self._server_picker = QComboBox(page)
+        Above the tabs rather than inside the Sell tab, which is where it used
+        to live, because it stopped being the Sell tab's business: an item
+        cannot be sold across servers, so the prices, the auctions that inform
+        them, the WTB list and the holdings search are all answers about one
+        server too. A picker that scopes every tab belongs where every tab can
+        see it.
+        """
+        self._server_picker = QComboBox(self)
         self._server_picker.setToolTip(
-            "Which server these items are on. Prices are per server."
+            "Everything in this window is about one server: items can't be "
+            "traded between them, so prices, auctions and inventories are all "
+            "kept apart."
         )
         self._server_picker.currentIndexChanged.connect(self._on_server_picked)
+
+        self._server_note = QLabel("", self)
+        # Wrapped, so the sentence contributes its longest word to the window's
+        # minimum width rather than its whole length.
+        self._server_note.setWordWrap(True)
+
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("Server", self))
+        bar.addWidget(self._server_picker)
+        bar.addWidget(self._server_note, 1)
+        return bar
+
+    def _build_sell_tab(self) -> QWidget:
+        page = QWidget(self)
 
         self._character_picker = QComboBox(page)
         self._character_picker.setToolTip("One character's bags, or everything on this server.")
         self._character_picker.currentIndexChanged.connect(self._on_character_picked)
 
         scope = QHBoxLayout()
-        scope.addWidget(QLabel("Server", page))
-        scope.addWidget(self._server_picker, 1)
         scope.addWidget(QLabel("Character", page))
-        scope.addWidget(self._character_picker, 2)
+        scope.addWidget(self._character_picker, 1)
 
         load = QPushButton("Load inventory dump…", page)
         load.clicked.connect(self._on_load_dump)
@@ -584,13 +631,55 @@ class MerchantModeWindow(PluginWindow):
         buttons.addWidget(fill)
         buttons.addWidget(export)
 
-        # The ID column matters more than it looks: CONFIRMED and CONFLICT can
-        # only ever arise for items you own, so this tab is the only place a
-        # disagreement can surface — and a wrong ID links the wrong item into
-        # your auction without anything else on screen looking amiss.
+        # Two different gestures for the same complaint, and the difference is
+        # the whole point. Remove crops this copy of the dump; Filter writes a
+        # rule that survives the next twenty dumps on every character.
+        remove = QPushButton("Remove selected", page)
+        remove.setToolTip(
+            "Drop the selected rows from the stored dump. Reloading that "
+            "character brings them back — use Filter out for anything you never "
+            "want to see again."
+        )
+        remove.clicked.connect(self._on_remove_items)
+        hide = QPushButton("Filter out selected…", page)
+        hide.setToolTip(
+            "Write a rule that hides these item names, on every character and "
+            "every dump from now on. Editable on the Filters tab."
+        )
+        hide.clicked.connect(self._on_filter_selected)
+
+        self._show_filtered = QCheckBox("Show filtered", page)
+        self._show_filtered.setToolTip(
+            "Bring the filtered rows back into this list, marked as filtered — "
+            "for checking what a rule is actually catching."
+        )
+        self._show_filtered.toggled.connect(self._on_show_filtered)
+
+        row = QHBoxLayout()
+        row.addWidget(remove)
+        row.addWidget(hide)
+        row.addWidget(self._show_filtered)
+        row.addStretch(1)
+
+        # ID is a column you never read: it is the same "owned" on every row of
+        # a dumped inventory, and the number itself is one nobody types. The
+        # one case worth surfacing — the sources disagreeing — rides on the
+        # item's own name instead (see CONFLICT_MARK), and the column is here,
+        # hidden, for anyone who turns it on in settings.
         self._items_table = QTableWidget(0, 5, page)
         self._items_table.setHorizontalHeaderLabels(("Sell", "Item", "Price", "ID", "Where"))
         self._items_table.verticalHeader().setVisible(False)
+        self._items_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._items_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._items_table.setToolTip(
+            "Tick what you're selling. Right-click a row for filtering and "
+            "removal — the buttons above do the same thing."
+        )
+        # Right-click is where a merchant looking at a row of junk will reach
+        # first, and a feature you can only find by reading the button bar is a
+        # feature most people never find. Same actions, met halfway.
+        self._items_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._items_table.customContextMenuRequested.connect(self._on_items_context_menu)
         header = self._items_table.horizontalHeader()
         # Name and location are both free text and both worth reading, so they
         # share the slack; the fixed-shape columns take only what they need.
@@ -611,6 +700,7 @@ class MerchantModeWindow(PluginWindow):
         layout = QVBoxLayout()
         layout.addLayout(scope)
         layout.addLayout(buttons)
+        layout.addLayout(row)
         layout.addWidget(self._items_table, 1)
         layout.addWidget(self._budget)
         layout.addWidget(self._status)
@@ -620,9 +710,10 @@ class MerchantModeWindow(PluginWindow):
     def _build_find_tab(self) -> QWidget:
         """"Do you have a Fungi?" — answered before the buyer wanders off.
 
-        Deliberately unscoped where the Sell tab is scoped to one server: the
-        question here is whether the item is anywhere on the account, so every
-        row names its server rather than the list being filtered down to one.
+        Scoped to the chosen server like everything else. The buyer asking is
+        standing on one server and can only be sold to there, so a row naming a
+        mule on another one is not an answer — it is a line to read past in the
+        few seconds this tab exists to save.
         """
         page = QWidget(self)
 
@@ -631,14 +722,16 @@ class MerchantModeWindow(PluginWindow):
             "Who's holding…? Part of a name, a nickname, an acronym"
         )
         self._find_entry.setToolTip(
-            "Searches what you're holding, not the item list — the Market tab "
-            "does that. Nicknames and acronyms resolve the same way they do "
-            "for pricing."
+            "Searches what you're holding on this server, not the item list — "
+            "the Market tab does that. Nicknames and acronyms resolve the same "
+            "way they do for pricing."
         )
         self._find_entry.textChanged.connect(self._on_find_typed)
 
-        self._find_table = QTableWidget(0, 5, page)
-        self._find_table.setHorizontalHeaderLabels(("Item", "Where", "Count", "Server", "Dumped"))
+        # No Server column: every row is on the server named above the tabs, so
+        # a column repeating it forty times is the ID column's mistake again.
+        self._find_table = QTableWidget(0, 4, page)
+        self._find_table.setHorizontalHeaderLabels(("Item", "Where", "Count", "Dumped"))
         self._find_table.verticalHeader().setVisible(False)
         self._find_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._find_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -647,7 +740,7 @@ class MerchantModeWindow(PluginWindow):
         # only what they need.
         find_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         find_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for column in (2, 3, 4):
+        for column in (2, 3):
             find_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
 
         self._find_note = QLabel("", page)
@@ -721,6 +814,96 @@ class MerchantModeWindow(PluginWindow):
         page.setLayout(layout)
         return page
 
+    def _build_filters_tab(self) -> QWidget:
+        """The list of things you never want to see in an inventory again.
+
+        Most of a dump is not merchandise: food, drink, bone chips, the four
+        starting daggers every toon rolls with, a rack of merchant bags. Every
+        one of those sits between the two items you actually meant to
+        advertise, and deleting them only works until that character dumps
+        again. A rule outlives the dump.
+        """
+        page = QWidget(self)
+
+        self._filter_table = QTableWidget(0, 4, page)
+        self._filter_table.setHorizontalHeaderLabels(("On", "Rule", "Pattern", "Matches"))
+        self._filter_table.verticalHeader().setVisible(False)
+        self._filter_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._filter_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._filter_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        filter_header = self._filter_table.horizontalHeader()
+        filter_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for column in (0, 1, 3):
+            filter_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self._filter_table.itemChanged.connect(self._on_filter_toggled)
+
+        self._filter_pattern = QLineEdit(page)
+        self._filter_pattern.setPlaceholderText("Item name, or part of one")
+        self._filter_pattern.returnPressed.connect(self._on_add_filter)
+
+        self._filter_match = QComboBox(page)
+        for match in Match:
+            self._filter_match.addItem(match.label, str(match))
+
+        self._filter_action = QComboBox(page)
+        # Hide first: it is what almost every rule is for, and a picker whose
+        # default is the rare case is one people fix after the fact.
+        for action in (Action.HIDE, Action.KEEP):
+            self._filter_action.addItem(action.label, str(action))
+        self._filter_action.setToolTip(
+            "Keep is an exception, and it always wins: hide anything containing "
+            "“bag”, keep “Bag of the Tinkerers”, in either order."
+        )
+
+        add = QPushButton("Add", page)
+        add.clicked.connect(self._on_add_filter)
+
+        # Reads as a sentence left to right — "Hide · contains · bag" — so the
+        # row needs no label of its own, which is what keeps the window's
+        # minimum width where the rest of the tabs put it.
+        entry = QHBoxLayout()
+        entry.addWidget(self._filter_action)
+        entry.addWidget(self._filter_match)
+        entry.addWidget(self._filter_pattern, 1)
+        entry.addWidget(add)
+
+        remove = QPushButton("Remove selected", page)
+        remove.clicked.connect(self._on_remove_filters)
+        suggest_button = QPushButton("Add suggested rules", page)
+        suggest_button.setToolTip(
+            "A short starter list — merchant bags, newbie armour, food and "
+            "drink. Nothing is applied until you add it, and every rule is "
+            "yours to edit or delete."
+        )
+        suggest_button.clicked.connect(self._on_add_suggested_filters)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(remove)
+        buttons.addWidget(suggest_button)
+        buttons.addStretch(1)
+
+        self._filter_summary = QLabel("", page)
+        self._filter_summary.setWordWrap(True)
+
+        note = QLabel(
+            "Filters hide; they never delete. A filtered item stays in the "
+            "dump, stays findable on the Find tab, and comes straight back when "
+            "you switch a rule off — and every list that hides something says "
+            "how many. Rules are account-wide rather than per server: junk is "
+            "junk on every server.",
+            page,
+        )
+        note.setWordWrap(True)
+
+        layout = QVBoxLayout()
+        layout.addLayout(entry)
+        layout.addWidget(self._filter_table, 1)
+        layout.addLayout(buttons)
+        layout.addWidget(self._filter_summary)
+        layout.addWidget(note)
+        page.setLayout(layout)
+        return page
+
     def _build_buy_tab(self) -> QWidget:
         page = QWidget(self)
 
@@ -732,6 +915,9 @@ class MerchantModeWindow(PluginWindow):
 
         self._want_list = QListWidget(page)
         self._want_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+
+        self._want_note = QLabel("", page)
+        self._want_note.setWordWrap(True)
 
         note = QLabel(
             "These are items you don't own, so their IDs come from PigParse and "
@@ -745,6 +931,7 @@ class MerchantModeWindow(PluginWindow):
         layout.addWidget(self._want_entry)
         layout.addWidget(self._want_list, 1)
         layout.addWidget(remove)
+        layout.addWidget(self._want_note)
         layout.addWidget(note)
         page.setLayout(layout)
         return page
@@ -879,6 +1066,7 @@ class MerchantModeWindow(PluginWindow):
         self._render_detail()
         self._render_found()
         self._render_dumps()
+        self._render_filters(state)
         self._status.setText(state.get("status", ""))
 
     def _render_scope(self, state: dict) -> None:
@@ -921,6 +1109,11 @@ class MerchantModeWindow(PluginWindow):
         finally:
             self._character_picker.blockSignals(False)
 
+        self._server_note.setText(
+            f"Scopes every tab: {_server_label(self._current_server())} prices, "
+            "holdings and auctions. Items can't cross servers."
+        )
+
     def _current_server(self) -> str:
         return str(self._server_picker.currentData() or "")
 
@@ -928,8 +1121,16 @@ class MerchantModeWindow(PluginWindow):
         return str(self._character_picker.currentData() or "")
 
     def _visible_holdings(self) -> list:
+        """What the Sell table lists: this server, this character, unfiltered.
+
+        ``include_filtered`` follows the checkbox rather than being fixed, so
+        the same call backs both the normal view and the "what is that rule
+        actually catching?" view.
+        """
         return self._plugin.holdings(
-            server=self._current_server(), character=self._current_character()
+            server=self._current_server(),
+            character=self._current_character(),
+            include_filtered=self._show_filtered.isChecked(),
         )
 
     def _render_items(self, state: dict) -> None:
@@ -938,6 +1139,10 @@ class MerchantModeWindow(PluginWindow):
         selected = set(priced)
         now = datetime.now()
         after = self._plugin.stale_after()
+        rules = self._plugin.filters()
+        warning = _warning_colour(self)
+        ink = _ink(self)
+        self._items_table.setColumnHidden(3, not self._plugin.settings().get("show_ids", False))
 
         self._items_table.blockSignals(True)
         try:
@@ -951,29 +1156,49 @@ class MerchantModeWindow(PluginWindow):
                     if item.name.casefold() in selected
                     else Qt.CheckState.Unchecked
                 )
+                # Everything the delete and filter buttons need to name this
+                # exact row of this exact dump.
                 check.setData(Qt.ItemDataRole.UserRole, item.item_id)
                 check.setData(Qt.ItemDataRole.UserRole + 1, holding.character)
+                check.setData(Qt.ItemDataRole.UserRole + 2, item.location)
+                check.setData(Qt.ItemDataRole.UserRole + 3, holding.server)
                 self._items_table.setItem(row, 0, check)
 
-                name = QTableWidgetItem(item.name)
+                resolved = self._plugin.resolve_id(item.name)
+                disputed = resolved is not None and resolved.status is IdStatus.CONFLICT
+                hidden_by = rules.reason(item.name)
+
+                name = QTableWidgetItem(item.name + (CONFLICT_MARK if disputed else ""))
                 name.setFlags(name.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                # The listing is built from this cell, so the real name lives in
+                # the data rather than the text — the marks are for the reader.
+                name.setData(Qt.ItemDataRole.UserRole, item.name)
+                if disputed:
+                    name.setForeground(warning)
+                    name.setToolTip(
+                        f"Your dump says id {resolved.item_id}, PigParse says "
+                        f"{resolved.alternate_id}. The link will use "
+                        f"{resolved.item_id} — click it in game to be sure. A "
+                        "wrong id shows the right name and only misbehaves on "
+                        "click."
+                    )
+                elif hidden_by is not None:
+                    # Only reachable with "Show filtered" on, which is exactly
+                    # when you want to know which rule caught this.
+                    name.setForeground(_alpha(ink, 110))
+                    name.setToolTip(f"Filtered — {hidden_by.describe()}")
                 self._items_table.setItem(row, 1, name)
 
                 self._items_table.setItem(
                     row, 2, QTableWidgetItem(priced.get(item.name.casefold(), ""))
                 )
 
-                resolved = self._plugin.resolve_id(item.name)
                 badge = QTableWidgetItem(
-                    _STATUS_BADGE.get(resolved.status, "?") if resolved else "?"
+                    f"{item.item_id} · {_STATUS_BADGE.get(resolved.status, '?')}"
+                    if resolved
+                    else str(item.item_id)
                 )
                 badge.setFlags(badge.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                if resolved is not None and resolved.status is IdStatus.CONFLICT:
-                    badge.setToolTip(
-                        f"Your dump says {resolved.item_id}, PigParse says "
-                        f"{resolved.alternate_id}. The link will use "
-                        f"{resolved.item_id} — click it in game to be sure."
-                    )
                 self._items_table.setItem(row, 3, badge)
 
                 # Which character is holding it, and how old that knowledge is.
@@ -992,6 +1217,10 @@ class MerchantModeWindow(PluginWindow):
             self._items_table.blockSignals(False)
 
     def _render_wanted(self, state: dict) -> None:
+        server = _server_label(self._current_server())
+        # The WTB list is per server because the prices beside it are, and a
+        # buy price from the wrong server is a number you'd act on.
+        self._want_note.setText(f"Your {server} buy list — each server keeps its own.")
         self._want_list.clear()
         for name in state["wanted"]:
             resolved = self._plugin.resolve_id(name)
@@ -1036,10 +1265,13 @@ class MerchantModeWindow(PluginWindow):
         self._budget.setText(" · ".join(parts))
 
     def _sources_line(self) -> str:
-        """Which characters' dumps are in play, and how fresh they are.
+        """Which characters' dumps are in play, how fresh they are, and what
+        is being kept out of the list.
 
         Lives on the Sell tab rather than only on Dumps because a warning you
-        have to open a panel to see is a warning you meet after the mistake.
+        have to open a panel to see is a warning you meet after the mistake —
+        and the same goes for the filter count. A list quietly missing rows is
+        worse than a cluttered one, so the number is never left unsaid.
         """
         records = self._plugin.inventories(server=self._current_server())
         if not records:
@@ -1051,6 +1283,11 @@ class MerchantModeWindow(PluginWindow):
         if stale:
             names = ", ".join(record.character for record in stale[:3])
             summary += f", {len(stale)} stale ({names}) — see the Dumps tab"
+        hidden = self._plugin.hidden_count(
+            server=self._current_server(), character=self._current_character()
+        )
+        if hidden and not self._show_filtered.isChecked():
+            summary += f" · {hidden} hidden by filters"
         return summary
 
     # --- find --------------------------------------------------------------
@@ -1061,16 +1298,18 @@ class MerchantModeWindow(PluginWindow):
         query = self._find_entry.text().strip()
         now = datetime.now()
         after = self._plugin.stale_after()
+        where = self._current_server()
+        server = _server_label(where)
 
         if len(query) < MIN_FIND_QUERY:
             self._find_table.setRowCount(0)
-            loaded = len(self._plugin.inventories())
+            loaded = len(self._plugin.inventories(server=where))
             self._find_note.setText(
-                f"Type part of an item name. Searches all {_plural(loaded, 'loaded dump')}, "
-                "across every server — a Blue mule's Fungi is still an answer to "
-                "'do you have one'."
+                f"Type part of an item name. Searches the {_plural(loaded, 'dump')} "
+                f"loaded for {server} — a buyer on {server} can't be sold a mule's "
+                "Fungi from another server, so this doesn't offer you one."
                 if loaded
-                else "No dumps loaded yet — load one on the Sell tab."
+                else f"No dumps loaded for {server} — load one on the Sell tab."
             )
             return
 
@@ -1081,7 +1320,6 @@ class MerchantModeWindow(PluginWindow):
             self._find_table.setItem(row, 0, _read_only(match.name))
             self._find_table.setItem(row, 1, _read_only(match.where()))
             self._find_table.setItem(row, 2, _read_only(f"{match.count:,}"))
-            self._find_table.setItem(row, 3, _read_only(_server_label(match.server)))
 
             stale = match.is_stale(now, after=after)
             age = _read_only(f"{match.age_text(now)} ago" + (" · stale" if stale else ""))
@@ -1091,19 +1329,162 @@ class MerchantModeWindow(PluginWindow):
             )
             if stale:
                 age.setForeground(warning)
-            self._find_table.setItem(row, 4, age)
+            self._find_table.setItem(row, 3, age)
 
         if matches:
             kinds = {match.kind.label for match in matches}
             self._find_note.setText(
-                f"{_plural(len(matches), 'holding')} — matched by {', '.join(sorted(kinds))}. "
-                "A location is only as fresh as the dump it came from."
+                f"{_plural(len(matches), 'holding')} on {server} — matched by "
+                f"{', '.join(sorted(kinds))}. A location is only as fresh as the "
+                "dump it came from."
             )
         else:
             self._find_note.setText(
-                f"Nothing held matches “{query}”. This searches your bags — use "
-                "the Market tab to look up an item you don't own."
+                f"Nothing held on {server} matches “{query}”. This searches your "
+                "bags on this server — use the Market tab to look up an item you "
+                "don't own, and the picker above to look at another server."
             )
+
+    # --- filters -----------------------------------------------------------
+    def _render_filters(self, state: dict) -> None:
+        rules = state.get("filters", [])
+        held = self._plugin.holdings(
+            server=self._current_server(),
+            character=self._current_character(),
+            include_filtered=True,
+        )
+        names = [holding.name for holding in held]
+
+        self._filter_table.blockSignals(True)
+        try:
+            self._filter_table.setRowCount(len(rules))
+            for row, rule in enumerate(rules):
+                switch = QTableWidgetItem()
+                switch.setFlags(
+                    (switch.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    & ~Qt.ItemFlag.ItemIsEditable
+                )
+                switch.setCheckState(
+                    Qt.CheckState.Checked if rule.enabled else Qt.CheckState.Unchecked
+                )
+                self._filter_table.setItem(row, 0, switch)
+
+                summary = _read_only(f"{rule.action.label} · {rule.match.label}")
+                summary.setToolTip(rule.describe())
+                self._filter_table.setItem(row, 1, summary)
+                self._filter_table.setItem(row, 2, _read_only(rule.pattern))
+
+                # What this rule is doing to the inventory in front of you,
+                # rather than in the abstract: a rule that catches nothing is
+                # usually a rule with a typo in it. "Matches" rather than
+                # "hiding" because a KEEP rule matches in order not to hide.
+                caught = sum(1 for name in names if rule.hits(normalize(name)))
+                hits = _read_only(f"{caught:,}" if rule.enabled else "—")
+                if rule.enabled and not caught:
+                    hits.setToolTip("Matches nothing you're currently holding here.")
+                self._filter_table.setItem(row, 3, hits)
+        finally:
+            self._filter_table.blockSignals(False)
+
+        hidden = self._plugin.hidden_count(
+            server=self._current_server(), character=self._current_character()
+        )
+        if not rules:
+            self._filter_summary.setText(
+                "No rules yet. Add one above, or select the junk on the Sell tab "
+                "and press “Filter out selected”."
+            )
+        else:
+            self._filter_summary.setText(
+                f"{_plural(len(rules), 'rule')} · hiding {hidden} of "
+                f"{_plural(len(names), 'held item')} on "
+                f"{_server_label(self._current_server())}."
+            )
+
+    def _selected_filter_rows(self) -> list[int]:
+        return sorted({index.row() for index in self._filter_table.selectedIndexes()})
+
+    def _on_add_filter(self) -> None:
+        pattern = self._filter_pattern.text().strip()
+        if not pattern:
+            return
+        rule = FilterRule(
+            pattern=pattern,
+            match=Match(str(self._filter_match.currentData())),
+            action=Action(str(self._filter_action.currentData())),
+        )
+        if not self._plugin.add_filters([rule]):
+            QMessageBox.information(
+                self, "Merchant Mode", "That rule is already in the list (or matches nothing)."
+            )
+            return
+        self._filter_pattern.clear()
+        self._reload()
+
+    def _on_remove_filters(self) -> None:
+        rows = self._selected_filter_rows()
+        if not rows:
+            QMessageBox.information(self, "Merchant Mode", "Pick a rule to remove.")
+            return
+        self._plugin.remove_filters(rows)
+        self._reload()
+
+    def _on_add_suggested_filters(self) -> None:
+        added = self._plugin.add_filters(list(SUGGESTED_RULES))
+        self._reload()
+        if not added:
+            QMessageBox.information(
+                self, "Merchant Mode", "Every suggested rule is already in your list."
+            )
+
+    def _on_filter_toggled(self, item: QTableWidgetItem) -> None:
+        """A rule switched on or off in place — the list itself is unchanged.
+
+        Off rather than deleted is the point: "is this the rule hiding my
+        Fungi?" is a question you answer by turning one off for a moment, not
+        by retyping it afterwards.
+        """
+        if item.column() != 0:
+            return
+        rules = self._plugin.filter_rules()
+        row = item.row()
+        if not 0 <= row < len(rules):
+            return
+        wanted = item.checkState() is Qt.CheckState.Checked
+        if rules[row].enabled == wanted:
+            return
+        rules[row] = replace(rules[row], enabled=wanted)
+        self._plugin.set_filters(rules)
+        self._reload()
+
+    def _on_show_filtered(self, _checked: bool) -> None:
+        self._reload()
+
+    def _on_filter_selected(self) -> None:
+        """Turn the selected rows into rules that outlive the dump."""
+        names = sorted({name for name, _row in self._selected_items()})
+        if not names:
+            QMessageBox.information(
+                self, "Merchant Mode", "Select the rows you never want to see again."
+            )
+            return
+        listed = "\n".join(f"  · {name}" for name in names[:8])
+        if len(names) > 8:
+            listed += f"\n  … and {len(names) - 8} more"
+        confirm = QMessageBox.question(
+            self,
+            "Merchant Mode",
+            f"Hide {_plural(len(names), 'item')} from every inventory list?\n\n"
+            f"{listed}\n\n"
+            "Nothing is deleted — these stay in your dumps and stay findable. "
+            "Edit or undo it on the Filters tab.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        added = self._plugin.add_filters([FilterRule(name, Match.EXACT) for name in names])
+        self._reload()
+        if not added:
+            QMessageBox.information(self, "Merchant Mode", "Those were already filtered.")
 
     # --- dumps -------------------------------------------------------------
     def _render_dumps(self) -> None:
@@ -1176,8 +1557,7 @@ class MerchantModeWindow(PluginWindow):
             return
         character, server = chosen
         if self._plugin.reload_dump(character, server):
-            self._rendered_version = -1
-            self.refresh()
+            self._reload()
             return
         # No remembered path, or the file has moved. Say which, and offer the
         # dialog rather than leaving a button that silently does nothing.
@@ -1205,8 +1585,7 @@ class MerchantModeWindow(PluginWindow):
         if confirm != QMessageBox.StandardButton.Yes:
             return
         self._plugin.forget_character(character, server)
-        self._rendered_version = -1
-        self.refresh()
+        self._reload()
 
     # --- market detail -----------------------------------------------------
     def _size_detail_table(self) -> None:
@@ -1247,7 +1626,10 @@ class MerchantModeWindow(PluginWindow):
         self._detail_chart.set_chart(chart)
         record = self._plugin.market_for(name)
         resolved = self._plugin.resolve_id(name)
-        title = name
+        # The server belongs in the heading, not a footnote: PigParse keys its
+        # averages on it and the sightings below were heard on one channel, so
+        # every number on this panel is an answer about one server only.
+        title = f"{name}   ·   {_server_label(self._current_server())}"
         if resolved is not None:
             title += f"   ·   id {resolved.item_id} ({_STATUS_BADGE.get(resolved.status, '?')})"
         self._detail_title.setText(title)
@@ -1319,8 +1701,7 @@ class MerchantModeWindow(PluginWindow):
             return
         self._detail_name = name
         self._plugin.request_prices([name])
-        self._rendered_version = -1
-        self.refresh()
+        self._reload()
 
     def _on_feed_selected(self) -> None:
         row = self._prices_table.currentRow()
@@ -1330,19 +1711,239 @@ class MerchantModeWindow(PluginWindow):
             self._render_detail()
 
     # --- actions -----------------------------------------------------------
-    def _on_server_picked(self, _index: int) -> None:
-        self._scope = self._current_server()
-        # Keep the plugin's pricing server in step with what's on screen: a
-        # price fetched against a server you aren't looking at is wrong in a
-        # way nothing on screen would reveal.
-        self._plugin.set_server(self._scope)
+    def _reload(self) -> None:
+        """Force a repaint on the next refresh. The version counter suppresses
+        redraws that would change nothing, and every action here changes
+        something the counter can't see."""
         self._rendered_version = -1
         self.refresh()
+
+    def _on_server_picked(self, _index: int) -> None:
+        self._scope = self._current_server()
+        # Everything in the window follows this: prices, auctions, the WTB
+        # list, the holdings search and the macro pack. A tab left looking at
+        # another server would be wrong in a way nothing on screen reveals.
+        self._plugin.set_server(self._scope)
+        self._reload()
 
     def _on_character_picked(self, _index: int) -> None:
         state = self._plugin.snapshot()
         self._render_items(state)
         self._render_budget()
+
+    def _selected_items(self) -> list[tuple[str, tuple[str, str, str, int]]]:
+        """``(name, (character, server, location, item_id))`` per selected row.
+
+        Read off the row's own stored data rather than its text: the name cell
+        can carry a conflict mark, and a listing built from what the label says
+        would be a listing for an item that doesn't exist.
+        """
+        found: list[tuple[str, tuple[str, str, str, int]]] = []
+        for row in sorted({index.row() for index in self._items_table.selectedIndexes()}):
+            check = self._items_table.item(row, 0)
+            name = self._items_table.item(row, 1)
+            if check is None or name is None:
+                continue
+            found.append(
+                (
+                    str(name.data(Qt.ItemDataRole.UserRole) or name.text()),
+                    (
+                        str(check.data(Qt.ItemDataRole.UserRole + 1) or ""),
+                        str(check.data(Qt.ItemDataRole.UserRole + 3) or ""),
+                        str(check.data(Qt.ItemDataRole.UserRole + 2) or ""),
+                        int(check.data(Qt.ItemDataRole.UserRole) or 0),
+                    ),
+                )
+            )
+        return found
+
+    # --- right-click on the Sell table -------------------------------------
+    def _on_items_context_menu(self, point) -> None:
+        """Pop the row menu where the pointer is."""
+        self._select_row_at(point)
+        menu = self._items_menu()
+        if menu is not None:
+            menu.exec(self._items_table.viewport().mapToGlobal(point))
+
+    def _select_row_at(self, point) -> None:
+        """Make the row under ``point`` the selection, unless it already is.
+
+        A row the user right-clicked but had not selected becomes the selection
+        first, the way every table in every other application behaves —
+        otherwise the menu would act on some other row and the two gestures
+        would look unrelated. An existing multi-row selection is left alone,
+        which is what makes "select five, right-click one of them, filter them
+        all out" work.
+        """
+        row = self._items_table.rowAt(point.y())
+        if row < 0:
+            return
+        model = self._items_table.selectionModel()
+        if model is None or not model.isRowSelected(row):
+            self._items_table.selectRow(row)
+
+    def _items_menu(self) -> QMenu | None:
+        """The row menu, built from the current selection.
+
+        Split out from the event handler so it can be inspected and triggered
+        without a pointer — a menu that only exists inside ``exec()`` is a menu
+        no test can read.
+        """
+        chosen = self._selected_items()
+        if not chosen:
+            return None
+        names = sorted({name for name, _row in chosen})
+        menu = QMenu(self._items_table)
+        rules = self._plugin.filters()
+        already = [name for name in names if rules.hidden(name)]
+
+        # Offering to filter something already filtered is an entry that does
+        # nothing, on the one row where the useful action is the opposite one.
+        if len(already) < len(names):
+            if len(names) == 1:
+                # One row, one click, no dialog: the rule is reversible on the
+                # Filters tab and the status line reports the new hidden count,
+                # so a confirmation here would be friction protecting nothing.
+                filter_out = menu.addAction(f"Filter out “{names[0]}”")
+                filter_out.triggered.connect(lambda: self._filter_out_exactly(names))
+            else:
+                filter_out = menu.addAction(f"Filter out these {len(names)} items…")
+                filter_out.triggered.connect(self._on_filter_selected)
+
+            # The rule that catches a family rather than a name — "any bag",
+            # "any rusty anything" — which is the rule people actually want and
+            # the one they would never think to go and write.
+            pattern = menu.addAction("Filter out items containing…")
+            pattern.triggered.connect(lambda: self._filter_out_containing(names[0]))
+
+        caught = [rule for rule in (rules.reason(name) for name in already) if rule is not None]
+        if caught:
+            # Only reachable with "Show filtered" on. Being able to undo a rule
+            # from the row it is acting on is the other half of being able to
+            # write one there.
+            culprit = caught[0]
+            stop = menu.addAction(f"Stop filtering ({culprit.describe()})")
+            stop.triggered.connect(lambda: self._stop_filtering(culprit))
+
+        menu.addSeparator()
+        remove = menu.addAction(f"Remove {_plural(len(chosen), 'row')} from this dump…")
+        remove.triggered.connect(self._on_remove_items)
+
+        menu.addSeparator()
+        manage = menu.addAction("Manage filters…")
+        manage.triggered.connect(self._show_filters_tab)
+        return menu
+
+    def _show_filters_tab(self) -> None:
+        self._tabs.setCurrentWidget(self._filters_page)
+
+    def _filter_out_exactly(self, names: list[str]) -> None:
+        added = self._plugin.add_filters([FilterRule(name, Match.EXACT) for name in names])
+        self._reload()
+        if not added:
+            QMessageBox.information(self, "Merchant Mode", "That was already filtered.")
+
+    def _filter_out_containing(self, seed: str) -> None:
+        """Ask for the substring, offering the item's name as a starting point.
+
+        Prefilled and selected rather than blank: the useful rule is almost
+        always a word out of the name in front of you, and typing it back in
+        from memory is how a good idea becomes not worth the bother.
+        """
+        pattern, accepted = QInputDialog.getText(
+            self,
+            "Merchant Mode",
+            "Hide every item whose name contains:",
+            text=seed,
+        )
+        if not accepted or not pattern.strip():
+            return
+        rule = FilterRule(pattern.strip(), Match.CONTAINS)
+        catches = [
+            holding.name
+            for holding in self._plugin.holdings(
+                server=self._current_server(), include_filtered=True
+            )
+            if rule.hits(normalize(holding.name))
+        ]
+        if not catches:
+            QMessageBox.information(
+                self,
+                "Merchant Mode",
+                f"Nothing you're holding on this server matches “{pattern.strip()}”.\n\n"
+                "The rule would be added and do nothing — check the spelling.",
+            )
+            return
+        listed = "\n".join(f"  · {name}" for name in sorted(set(catches))[:8])
+        if len(set(catches)) > 8:
+            listed += f"\n  … and {len(set(catches)) - 8} more"
+        confirm = QMessageBox.question(
+            self,
+            "Merchant Mode",
+            f"Hide {_plural(len(catches), 'held item')} matching “{pattern.strip()}”?\n\n"
+            f"{listed}\n\n"
+            "Nothing is deleted, and future dumps are caught by the same rule. "
+            "Spare one of them with a Keep rule on the Filters tab.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._plugin.add_filters([rule])
+        self._reload()
+
+    def _stop_filtering(self, rule: FilterRule) -> None:
+        """Drop one rule, warning when it is hiding more than the row clicked."""
+        rules = self._plugin.filter_rules()
+        indices = [index for index, other in enumerate(rules) if other.identity == rule.identity]
+        if not indices:
+            return
+        also = [
+            holding.name
+            for holding in self._plugin.holdings(
+                server=self._current_server(), include_filtered=True
+            )
+            if rule.hits(normalize(holding.name))
+        ]
+        if len(set(also)) > 1:
+            confirm = QMessageBox.question(
+                self,
+                "Merchant Mode",
+                f"{rule.describe()}\n\n"
+                f"Removing it brings back {_plural(len(set(also)), 'item')} here, "
+                "not just this one.",
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+        self._plugin.remove_filters(indices)
+        self._reload()
+
+    def _on_remove_items(self) -> None:
+        """Drop the selected rows from the stored dump.
+
+        The counterpart to a filter rule and deliberately weaker than one: this
+        crops the copy of the dump the plugin is holding, and the next reload of
+        that character brings the rows straight back. Said in the dialog,
+        because a delete that silently un-deletes itself is worse than no
+        delete at all.
+        """
+        chosen = self._selected_items()
+        if not chosen:
+            QMessageBox.information(self, "Merchant Mode", "Select the rows you want gone.")
+            return
+        names = sorted({name for name, _row in chosen})
+        listed = ", ".join(names[:4]) + (f" and {len(names) - 4} more" if len(names) > 4 else "")
+        confirm = QMessageBox.question(
+            self,
+            "Merchant Mode",
+            f"Remove {_plural(len(chosen), 'row')} from the stored inventory?\n\n"
+            f"{listed}\n\n"
+            "This edits the loaded dump, not the file — reloading that character "
+            "brings them back. For something you never want to see again, use "
+            "“Filter out selected”.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._plugin.remove_items([row for _name, row in chosen])
+        self._reload()
 
     def _on_load_dump(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1373,19 +1974,19 @@ class MerchantModeWindow(PluginWindow):
                 "Merchant Mode",
                 "That file isn't an /outputfile inventory dump, or held nothing sellable.",
             )
-        self._rendered_version = -1
-        self.refresh()
+        self._reload()
 
     def _on_item_changed(self, _item: QTableWidgetItem) -> None:
         self._plugin.set_listings(self._collect_listings())
         self._render_budget()
 
     def _collect_listings(self) -> list[Listing]:
-        """Ticked rows, merged with ticks made under another scope.
+        """Ticked rows, merged with ticks made under another character.
 
-        The table only shows one server and character at a time, so reading it
-        alone would silently drop every item ticked on a different mule the
-        moment the picker moved.
+        The table only shows one character at a time, so reading it alone would
+        silently drop every item ticked on a different mule the moment the
+        picker moved. Ticks on *another server* aren't merged and mustn't be —
+        they live in that server's own list.
         """
         visible = {holding.name.casefold() for holding in self._visible_holdings()}
         listings = [
@@ -1404,7 +2005,8 @@ class MerchantModeWindow(PluginWindow):
             listings.append(
                 Listing(
                     item_id=int(check.data(Qt.ItemDataRole.UserRole) or 0),
-                    name=name.text(),
+                    # Never the label: it may carry a conflict mark.
+                    name=str(name.data(Qt.ItemDataRole.UserRole) or name.text()),
                     price=price.text() if price is not None else "",
                     character=str(check.data(Qt.ItemDataRole.UserRole + 1) or ""),
                 )
@@ -1421,8 +2023,7 @@ class MerchantModeWindow(PluginWindow):
         self._plugin.set_listings(self._collect_listings())
         changed = self._plugin.fill_prices()
         missing = self._plugin.unpriced_listings()
-        self._rendered_version = -1
-        self.refresh()
+        self._reload()
 
         if missing and self._plugin.request_prices(missing):
             return  # the status line reports it; the timer picks up the result
@@ -1467,8 +2068,7 @@ class MerchantModeWindow(PluginWindow):
         state = self._plugin.snapshot()
         self._plugin.set_wanted([*state["wanted"], name])
         self._want_entry.clear()
-        self._rendered_version = -1
-        self.refresh()
+        self._reload()
 
     def _on_remove_wanted(self) -> None:
         drop = {item.row() for item in self._want_list.selectedIndexes()}
@@ -1478,13 +2078,11 @@ class MerchantModeWindow(PluginWindow):
         self._plugin.set_wanted(
             [name for index, name in enumerate(state["wanted"]) if index not in drop]
         )
-        self._rendered_version = -1
-        self.refresh()
+        self._reload()
 
     def showEvent(self, event) -> None:  # immediate repaint on reopen
         super().showEvent(event)
-        self._rendered_version = -1
-        self.refresh()
+        self._reload()
 
 
 def build_settings_page(parent: QWidget | None, values: dict) -> QWidget:
@@ -1542,6 +2140,21 @@ def build_settings_page(parent: QWidget | None, values: dict) -> QWidget:
     abbreviate.setObjectName("abbreviate")
     form.addRow(abbreviate)
 
+    show_ids = QCheckBox("Show the item ID column on the Sell tab", page)
+    show_ids.setChecked(bool(values.get("show_ids", False)))
+    show_ids.setObjectName("show_ids")
+    form.addRow(show_ids)
+
+    ids_note = QLabel(
+        "Off by default: for a dumped inventory the column reads “owned” on "
+        "every row, and the id itself is a number you never type. The one case "
+        "worth knowing about — your dump and PigParse naming different ids for "
+        "the same item — marks the item's own name with ⚠ either way.",
+        page,
+    )
+    ids_note.setWordWrap(True)
+    form.addRow(ids_note)
+
     prefix = QLineEdit(page)
     prefix.setText(str(values.get("prefix", "/auc WTS ")))
     prefix.setObjectName("prefix")
@@ -1557,9 +2170,10 @@ def read_settings_page(page: QWidget) -> dict:
         spin = page.findChild(QSpinBox, name)
         if spin is not None:
             values[name] = int(spin.value())
-    check = page.findChild(QCheckBox, "abbreviate")
-    if check is not None:
-        values["abbreviate"] = bool(check.isChecked())
+    for name in ("abbreviate", "show_ids"):
+        check = page.findChild(QCheckBox, name)
+        if check is not None:
+            values[name] = bool(check.isChecked())
     prefix = page.findChild(QLineEdit, "prefix")
     if prefix is not None:
         values["prefix"] = prefix.text()

@@ -480,7 +480,7 @@ def test_saving_stamps_the_current_schema_version() -> None:
 
     plugin, ctx = _activated()
     plugin.set_wanted(["Manastone"])
-    assert ctx.storage.data["schema_version"] == SCHEMA_VERSION == 4
+    assert ctx.storage.data["schema_version"] == SCHEMA_VERSION == 5
 
 
 def test_inventories_survive_a_restart(tmp_path) -> None:
@@ -675,8 +675,13 @@ def test_holdings_scope_to_one_server(tmp_path) -> None:
         "Manastone",
         "Rubicite Breastplate",
     }
-    # No filter still means everything — the UI just never asks for that.
-    assert len(plugin.holdings()) == 5
+    # Asking for no server in particular means the one in play — the last dump
+    # loaded set it to Blue. There is no every-server holdings view at all:
+    # items don't cross servers, so a pooled list is one you would have to
+    # re-filter in your head on every read.
+    assert plugin.server() == "blue"
+    assert len(plugin.holdings()) == 2
+    assert len(plugin.all_holdings()) == 5
 
 
 def test_a_dump_with_no_server_stays_visible_in_its_own_bucket(tmp_path) -> None:
@@ -738,16 +743,37 @@ def test_find_holdings_answers_a_half_remembered_name(tmp_path) -> None:
     assert found[0].character == "Mulebank"
 
 
-def test_find_holdings_crosses_servers_where_the_sell_tab_does_not(tmp_path) -> None:
-    """"Is it anywhere on the account" is a different question to "can I sell it"."""
+def test_find_holdings_answers_about_one_server(tmp_path) -> None:
+    """A buyer standing on Green can't be sold the Blue mule's Manastone.
+
+    This used to search every server on the argument that "is it anywhere on
+    the account" is a different question to "can I sell it to you". It is — but
+    it isn't the question this is asked, and a row for a mule the buyer can
+    never trade with costs a read in the few seconds the tab exists to save.
+    """
     plugin, _ = _activated()
     plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server="green")
     plugin.load_dump(_dump(tmp_path, "Mulebank", MULE_DUMP), server="blue")
 
+    plugin.set_server("green")
+    assert plugin.find_holdings("manastone") == []
+    assert [match.name for match in plugin.find_holdings("cloak")] == ["Cloak of Flames"]
+
+    plugin.set_server("blue")
     assert {match.server for match in plugin.find_holdings("manastone")} == {"blue"}
-    assert plugin.holdings(server="green") and not [
-        holding for holding in plugin.holdings(server="green") if holding.name == "Manastone"
-    ]
+    assert plugin.find_holdings("cloak") == []
+
+
+def test_find_holdings_still_finds_what_the_filter_list_hides(tmp_path) -> None:
+    """Not advertising your Bone Chips is not the same as not owning them."""
+    from merchant_mode.filters import FilterRule, Match
+
+    plugin, _ = _activated()
+    plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server="green")
+    plugin.add_filters([FilterRule("Large Bag", Match.EXACT)])
+
+    assert [holding.name for holding in plugin.holdings() if holding.name == "Large Bag"] == []
+    assert [match.name for match in plugin.find_holdings("large bag")] == ["Large Bag"]
 
 
 def test_find_holdings_follows_a_nickname(tmp_path) -> None:
@@ -878,3 +904,286 @@ def test_reloading_a_dump_whose_file_vanished_reports_failure(tmp_path) -> None:
     assert plugin.reload_dump("Mulebank", "green") == 0
     # The dump it already has is still there — a failed reload loses nothing.
     assert len(plugin.holdings()) == 2
+
+
+# --- one server at a time ---------------------------------------------------
+#
+# The invariant the v0.4.0 release exists for: items cannot move between P99
+# servers, so a Blue item can never be sold to a Green buyer. Prices, ticked
+# listings, the WTB list and the auction feed are all evidence about one server
+# and are worthless — worse, quietly wrong — under another's heading.
+
+
+def test_listings_are_kept_per_server() -> None:
+    plugin, _ = _activated()
+    plugin.set_server("green")
+    plugin.set_listings([Listing(11621, "Cloak of Flames", "5k")])
+    plugin.set_server("blue")
+    plugin.set_listings([Listing(4567, "Manastone", "40k")])
+
+    assert [listing.name for listing in plugin.snapshot()["listings"]] == ["Manastone"]
+    plugin.set_server("green")
+    assert [listing.name for listing in plugin.snapshot()["listings"]] == ["Cloak of Flames"]
+
+
+def test_the_macro_pack_is_built_from_one_server_only() -> None:
+    """A /auc line reaches one channel; a pack spanning two is unpostable."""
+    plugin, _ = _activated()
+    plugin.apply_settings({"abbreviate": False})  # so the names are readable here
+    plugin.set_server("green")
+    plugin.set_listings([Listing(11621, "Cloak of Flames", "5k")])
+    plugin.set_server("blue")
+    plugin.set_listings([Listing(4567, "Manastone", "40k")])
+
+    lines = [line for social in plugin.build().socials for line in social["lines"]]
+    assert any("Manastone" in line for line in lines)
+    assert not any("Cloak of Flames" in line for line in lines)
+
+
+def test_the_wtb_list_is_kept_per_server() -> None:
+    plugin, _ = _activated()
+    plugin.set_server("green")
+    plugin.set_wanted(["Manastone"])
+    plugin.set_server("blue")
+    assert plugin.snapshot()["wanted"] == []
+    plugin.set_server("green")
+    assert plugin.snapshot()["wanted"] == ["Manastone"]
+
+
+def test_an_auction_heard_on_one_server_does_not_price_another() -> None:
+    """The failure this prevents is invisible: a Blue ask, quoted on Green,
+    looks exactly like a Green price."""
+
+    @dataclass
+    class FakePlayer:
+        server: int = 1  # Blue
+
+    ctx = FakePluginContext(MerchantModePlugin.meta, player=FakePlayer())
+    plugin = create_plugin()
+    plugin.activate(ctx)
+    plugin.observe_auction("WTS Cloak of Flames 5k", timestamp=T0, sender="Someone")
+
+    assert plugin.suggest_price("Cloak of Flames", server="blue").text == "5k"
+    assert not plugin.suggest_price("Cloak of Flames", server="green").known
+
+
+def test_the_auction_feed_is_scoped_to_the_server_it_was_heard_on() -> None:
+    plugin, _ = _activated()
+    plugin.set_server("green")
+    plugin.observe_auction("WTS Manastone 42k", timestamp=T0)
+    plugin.set_server("blue")
+    plugin.observe_auction("WTS Cloak of Flames 5k", timestamp=T0)
+
+    assert [obs.name for obs in plugin.snapshot()["history"]] == ["Cloak of Flames"]
+    plugin.set_server("green")
+    assert [obs.name for obs in plugin.snapshot()["history"]] == ["Manastone"]
+
+
+def test_pigparse_prices_are_filed_under_the_server_they_were_fetched_for() -> None:
+    plugin, _ = _activated()
+    plugin._apply_prices([_FakeItemPrice("Manastone", 4567, 42000, samples=9)], server="green")
+    plugin._apply_prices([_FakeItemPrice("Manastone", 4567, 61000, samples=9)], server="blue")
+
+    assert plugin.market_for("Manastone", server="green").headline == 42000
+    assert plugin.market_for("Manastone", server="blue").headline == 61000
+    assert plugin.market_for("Manastone", server="red") is None
+
+
+def test_filling_prices_uses_this_server_and_no_other() -> None:
+    plugin, _ = _activated()
+    plugin._apply_prices([_FakeItemPrice("Manastone", 4567, 42000, samples=9)], server="green")
+    plugin.set_server("blue")
+    plugin.set_listings([Listing(4567, "Manastone", "")])
+
+    assert plugin.fill_prices() == 0
+    plugin.set_server("green")
+    plugin.set_listings([Listing(4567, "Manastone", "")])
+    assert plugin.fill_prices() == 1
+    assert plugin.snapshot()["listings"][0].price == "42k"
+
+
+def test_polling_only_asks_about_the_server_in_play(tmp_path) -> None:
+    plugin, _ = _activated()
+    plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server="green")
+    plugin.load_dump(_dump(tmp_path, "Mulebank", MULE_DUMP), server="blue")
+
+    plugin.set_server("green")
+    names = set(plugin._pending_price_names())
+    assert "Cloak of Flames" in names
+    assert "Manastone" not in names
+
+
+def test_polling_skips_what_the_filter_list_hides(tmp_path) -> None:
+    """Asking PigParse to price forty rows of food is forty wasted questions."""
+    from merchant_mode.filters import FilterRule, Match
+
+    plugin, _ = _activated()
+    plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server="green")
+    plugin.add_filters([FilterRule("Large Bag", Match.EXACT)])
+    assert "Large Bag" not in set(plugin._pending_price_names())
+
+
+def test_the_chart_only_plots_this_server(tmp_path) -> None:
+    plugin, _ = _activated()
+    plugin.set_server("blue")
+    plugin.observe_auction("WTS Cloak of Flames 5k", timestamp=T0)
+    plugin.set_server("green")
+
+    assert plugin.chart_for("Cloak of Flames").empty
+    assert not plugin.chart_for("Cloak of Flames", server="blue").empty
+
+
+def test_every_server_keeps_its_own_state_across_a_restart() -> None:
+    plugin, ctx = _activated()
+    plugin.set_server("green")
+    plugin.set_listings([Listing(11621, "Cloak of Flames", "5k")])
+    plugin.set_wanted(["Manastone"])
+    plugin.observe_auction("WTS Cloak of Flames 5k", timestamp=T0)
+    plugin._apply_prices([_FakeItemPrice("Manastone", 4567, 42000, samples=9)], server="green")
+    plugin.set_server("blue")
+    plugin.set_listings([Listing(4567, "Manastone", "40k")])
+    plugin.deactivate()
+
+    restored = create_plugin()
+    restored.activate(FakePluginContext(MerchantModePlugin.meta, storage=ctx.storage))
+    restored.set_server("green")
+    state = restored.snapshot()
+    assert [listing.name for listing in state["listings"]] == ["Cloak of Flames"]
+    assert state["wanted"] == ["Manastone"]
+    assert [obs.name for obs in state["history"]] == ["Cloak of Flames"]
+    assert restored.market_for("Manastone").headline == 42000
+
+    restored.set_server("blue")
+    assert [listing.name for listing in restored.snapshot()["listings"]] == ["Manastone"]
+    assert restored.market_for("Manastone") is None
+
+
+def test_a_v4_store_lands_on_the_server_it_remembered() -> None:
+    """Pre-v5 storage tracked one server at a time and said which.
+
+    Filing its listings, prices and history under "" instead would empty an
+    upgrading merchant's whole session the moment they picked their own server
+    back out of the box.
+    """
+    ctx = FakePluginContext(MerchantModePlugin.meta)
+    ctx.storage.data = {
+        "schema_version": 4,
+        "server": "blue",
+        "wanted": ["Manastone"],
+        "listings": [{"item_id": 11621, "name": "Cloak of Flames", "price": "5k"}],
+        "prices": {
+            "manastone": {
+                "name": "Manastone",
+                "averages": {"6mo": 42000},
+                "counts": {"6mo": 9},
+                "server": "blue",
+            }
+        },
+        "history": [
+            {"timestamp": T0.isoformat(), "name": "Manastone", "price": 40000, "wanted": False}
+        ],
+    }
+    plugin = create_plugin()
+    plugin.activate(ctx)
+
+    assert plugin.server() == "blue"
+    state = plugin.snapshot()
+    assert state["wanted"] == ["Manastone"]
+    assert [listing.name for listing in state["listings"]] == ["Cloak of Flames"]
+    assert [obs.name for obs in state["history"]] == ["Manastone"]
+    assert plugin.market_for("Manastone").headline == 42000
+
+    plugin.set_server("green")
+    assert plugin.snapshot()["listings"] == []
+    assert plugin.snapshot()["history"] == []
+
+
+# --- filters and clutter ----------------------------------------------------
+
+
+def test_filtered_items_leave_the_sellable_list_but_not_the_vault(tmp_path) -> None:
+    from merchant_mode.filters import FilterRule
+
+    plugin, _ = _activated()
+    plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server="green")
+    plugin.add_filters([FilterRule("bag")])
+
+    assert "Large Bag" not in {holding.name for holding in plugin.holdings()}
+    assert "Large Bag" in {
+        holding.name for holding in plugin.holdings(include_filtered=True)
+    }
+    assert plugin.hidden_count() == 1
+    # Nothing was deleted: switching the rule off brings it straight back.
+    plugin.set_filters([])
+    assert "Large Bag" in {holding.name for holding in plugin.holdings()}
+
+
+def test_filters_survive_a_restart_and_stay_account_wide(tmp_path) -> None:
+    from merchant_mode.filters import Action, FilterRule, Match
+
+    plugin, ctx = _activated()
+    plugin.add_filters(
+        [FilterRule("bag"), FilterRule("Bag of the Tinkerers", Match.EXACT, Action.KEEP)]
+    )
+    plugin.deactivate()
+
+    restored = create_plugin()
+    restored.activate(FakePluginContext(MerchantModePlugin.meta, storage=ctx.storage))
+    rules = restored.filters()
+    assert len(rules) == 2
+    assert rules.hidden("Large Bag")
+    assert not rules.hidden("Bag of the Tinkerers")
+    # Junk is junk everywhere: the list does not change with the server.
+    restored.set_server("blue")
+    assert restored.filters().hidden("Large Bag")
+
+
+def test_removing_items_drops_rows_and_their_listings(tmp_path) -> None:
+    plugin, _ = _activated()
+    plugin.load_dump(_dump(tmp_path, "Xantik", DUMP), server="green")
+    plugin.set_listings(
+        [
+            Listing(17969, "Large Bag", "", character="Xantik"),
+            Listing(11621, "Cloak of Flames", "5k", character="Xantik"),
+        ]
+    )
+
+    assert plugin.remove_items([("Xantik", "green", "General1", 17969)]) == 1
+    assert "Large Bag" not in {holding.name for holding in plugin.holdings()}
+    # A macro advertising an item you just said you don't have is the one
+    # failure worth preventing here.
+    assert [listing.name for listing in plugin.snapshot()["listings"]] == ["Cloak of Flames"]
+
+
+def test_removing_items_crops_the_copy_not_the_file(tmp_path) -> None:
+    """Said plainly in the UI too: a reload brings them back, and a filter is
+    what makes it stick."""
+    plugin, _ = _activated()
+    path = _dump(tmp_path, "Xantik", DUMP)
+    plugin.load_dump(path, server="green")
+    plugin.remove_items([("Xantik", "green", "General1", 17969)])
+    assert len(plugin.holdings()) == 2
+
+    assert plugin.reload_dump("Xantik", "green") == 3
+    assert len(plugin.holdings()) == 3
+
+
+def test_removing_leaves_the_same_item_in_a_different_bag_alone(tmp_path) -> None:
+    plugin, _ = _activated()
+    text = "\n".join(
+        (
+            "Location\tName\tID\tCount\tSlots",
+            "General1-Slot1\tBone Chips\t13073\t10\t0",
+            "General2-Slot1\tBone Chips\t13073\t4\t0",
+        )
+    )
+    plugin.load_dump(_dump(tmp_path, "Xantik", text), server="green")
+    assert plugin.remove_items([("Xantik", "green", "General1-Slot1", 13073)]) == 1
+    remaining = plugin.holdings()
+    assert [holding.item.location for holding in remaining] == ["General2-Slot1"]
+
+
+def test_removing_nothing_is_harmless() -> None:
+    plugin, _ = _activated()
+    assert plugin.remove_items([]) == 0
+    assert plugin.remove_items([("Nobody", "green", "Charm", 1)]) == 0
