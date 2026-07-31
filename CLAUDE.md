@@ -45,6 +45,16 @@ Nothing that prices, lists or advertises an item may call it.
   that imports PySide6, and `merchant_mode/__init__.py` imports it exclusively
   *inside* the window factories. `tests/test_no_qt.py` enforces both — add every
   new domain module to its `QT_FREE_MODULES` list.
+- **Imports follow the SDK's rules, and `tests/test_imports.py` enforces them**
+  — because every one of them fails only in the app, after CI and the validator
+  have gone green. Siblings are imported relatively (the host imports this
+  package as `nparseplus_user_plugins.merchant_mode`, so `from merchant_mode.x
+  import ...` resolves in this checkout and nowhere else); the SDK is used
+  through `nparseplus_sdk` itself and its documented `events`/`timers`/`ui`
+  re-exports, never `nparseplus_sdk.plugin` and friends; `nparseplus` is
+  imported inside the function that needs it, guarded, never at module scope;
+  and nothing comes from PyPI, since a frozen build has no pip. That test also
+  loads the package through `load_plugin_factory`, the way the app does.
 - Decisions live below the Qt line. `chartdata.py` decides what a chart should
   say; `PriceChartWidget` only puts it on screen. `finding.py` ranks; the table
   only lists. If a rule can be unit-tested without a display, it belongs there.

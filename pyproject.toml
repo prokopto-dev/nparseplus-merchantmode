@@ -15,12 +15,12 @@ readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.12"
 dependencies = [
-  # NOTE: `nparseplus-sdk` is not on PyPI yet, so this installs it from the
-  # app repo's `sdk/` subdirectory. ONCE `nparseplus-sdk` IS PUBLISHED,
-  # replace this line with the plain requirement:
-  #     "nparseplus-sdk>=1.0,<2",
-  # and do the same in .github/workflows/ci.yml and release.yml.
-  "nparseplus-sdk @ git+https://github.com/prokopto-dev/nparse-plus@master#subdirectory=sdk",
+  # The SDK is on PyPI; take it from there rather than from the app repo's
+  # `sdk/` subdirectory, so a dev environment resolves the same published
+  # artifact the app bundles instead of whatever `master` happens to hold.
+  # The range mirrors PluginMeta.requires_sdk — a plugin that builds against
+  # an SDK the app would refuse is a failure you want at install time.
+  "nparseplus-sdk>=1.0,<2",
 ]
 
 [project.optional-dependencies]
