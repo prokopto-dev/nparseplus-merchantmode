@@ -6,7 +6,7 @@ domain logic never imports PySide6. The window reads plugin state through
 against a version counter, so the driver thread and the GUI thread never share
 a mutable object.
 
-One server picker sits above the tabs and scopes all of them, because items
+One server picker sits beside the tabs and scopes all of them, because items
 cannot move between P99 servers: what you can list, what it is worth, what the
 channel said about it and which mule is holding it are all questions about one
 server, and a window where two tabs disagreed about which one would be a window
@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -117,6 +118,29 @@ def _read_only(text: str) -> QTableWidgetItem:
     item = QTableWidgetItem(text)
     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
     return item
+
+
+def _as_ledger(table: QTableWidget) -> None:
+    """The shared look for every table of rows in this window.
+
+    Banded rows instead of a full grid. Every one of these tables is read
+    *across* — item, price, who's holding it — and a grid line between each
+    pair of cells draws the eye down the columns instead, which is the shape of
+    a spreadsheet rather than of a list you scan. Banding keeps the row whole
+    and still tells adjacent rows apart, which is the one job the grid was
+    doing.
+
+    Not applied to the Market tab's window-averages table: that one genuinely
+    is a matrix, read both ways, and the grid is what makes it legible.
+    """
+    table.setAlternatingRowColors(True)
+    table.setShowGrid(False)
+    # A floor, not a fixed height: without grid lines the rows need the air to
+    # stay distinguishable, and the max() leaves a larger font's own metrics
+    # alone rather than squeezing it into a number measured at this one.
+    table.verticalHeader().setDefaultSectionSize(
+        max(table.verticalHeader().defaultSectionSize(), table.fontMetrics().height() + 10)
+    )
 
 
 def _server_label(key: str) -> str:
@@ -551,6 +575,7 @@ class MerchantModeWindow(PluginWindow):
         string."""
 
         self._tabs = QTabWidget(self)
+        self._tabs.setCornerWidget(self._build_server_bar(), Qt.Corner.TopRightCorner)
         self._tabs.addTab(self._build_sell_tab(), "Sell")
         self._tabs.addTab(self._build_find_tab(), "Find")
         self._tabs.addTab(self._build_buy_tab(), "Buy")
@@ -561,9 +586,27 @@ class MerchantModeWindow(PluginWindow):
         self._filters_page = self._build_filters_tab()
         self._tabs.addTab(self._filters_page, "Filters")
 
+        # Everything sits on one opaque panel. PluginWindow is translucent by
+        # default — the right call for a spell timer floating over the game, and
+        # the wrong one for this: any text that isn't inside the tab pane (the
+        # server picker, the tab labels' own strip) was being drawn over
+        # whatever happened to be behind the window, which on a dark EverQuest
+        # night means dark grey on black. A merchant window is a document you
+        # read for minutes at a time, not a HUD you glance at, so it gets a
+        # background of its own and every label a guaranteed contrast against
+        # it. The frame is what makes the tabs read as attached to a window
+        # rather than floating in mid-air.
+        panel = QFrame(self)
+        panel.setFrameShape(QFrame.Shape.StyledPanel)
+        panel.setAutoFillBackground(True)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.addWidget(self._tabs)
+
         layout = QVBoxLayout()
-        layout.addLayout(self._build_server_bar())
-        layout.addWidget(self._tabs)
+        # No margin of its own: the panel is the window, and a gap around it
+        # would put the translucency back as a border.
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(panel)
         self.setLayout(layout)
 
         self._refresh_timer = QTimer(self)
@@ -574,17 +617,25 @@ class MerchantModeWindow(PluginWindow):
         self.restore_visibility()
 
     # --- construction ------------------------------------------------------
-    def _build_server_bar(self) -> QHBoxLayout:
+    def _build_server_bar(self) -> QWidget:
         """The one control that scopes the whole window.
 
-        Above the tabs rather than inside the Sell tab, which is where it used
-        to live, because it stopped being the Sell tab's business: an item
-        cannot be sold across servers, so the prices, the auctions that inform
-        them, the WTB list and the holdings search are all answers about one
-        server too. A picker that scopes every tab belongs where every tab can
-        see it.
+        Outside the tabs, which is not where it used to live: it stopped being
+        the Sell tab's business once an item's server started deciding its
+        price, its auctions, its WTB entry and where the Find tab looks. A
+        picker that scopes every tab belongs where every tab can see it.
+
+        It rides in the tab bar's corner rather than on a strip of its own.
+        Two reasons, and the second is why it moved: a lone combo box on a
+        full-width row reads as a floating fragment of toolbar, and the strip
+        cost the window ~29px of minimum height, enough to push it past the
+        700px the README's screenshots are captured at.
+
+        No explanatory sentence beside it any more. It said items can't cross
+        servers, which every P99 player already knows from playing; the
+        tooltip keeps it for anyone who wonders why the window insists.
         """
-        self._server_picker = QComboBox(self)
+        self._server_picker = QComboBox()
         self._server_picker.setToolTip(
             "Everything in this window is about one server: items can't be "
             "traded between them, so prices, auctions and inventories are all "
@@ -592,15 +643,13 @@ class MerchantModeWindow(PluginWindow):
         )
         self._server_picker.currentIndexChanged.connect(self._on_server_picked)
 
-        self._server_note = QLabel("", self)
-        # Wrapped, so the sentence contributes its longest word to the window's
-        # minimum width rather than its whole length.
-        self._server_note.setWordWrap(True)
-
-        bar = QHBoxLayout()
-        bar.addWidget(QLabel("Server", self))
-        bar.addWidget(self._server_picker)
-        bar.addWidget(self._server_note, 1)
+        bar = QWidget()
+        layout = QHBoxLayout(bar)
+        # Flush with the tab bar: a corner widget sits inside the tab strip, and
+        # a layout margin here would drop it below the tabs' baseline.
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QLabel("Server"))
+        layout.addWidget(self._server_picker)
         return bar
 
     def _build_sell_tab(self) -> QWidget:
@@ -609,10 +658,10 @@ class MerchantModeWindow(PluginWindow):
         self._character_picker = QComboBox(page)
         self._character_picker.setToolTip("One character's bags, or everything on this server.")
         self._character_picker.currentIndexChanged.connect(self._on_character_picked)
-
-        scope = QHBoxLayout()
-        scope.addWidget(QLabel("Character", page))
-        scope.addWidget(self._character_picker, 1)
+        # Wide enough for a long character name and no wider. Stretched across
+        # the window it read as a search bar rather than as a picker with six
+        # entries in it, and a control's width is a claim about its contents.
+        self._character_picker.setMinimumWidth(180)
 
         load = QPushButton("Load inventory dump…", page)
         load.clicked.connect(self._on_load_dump)
@@ -626,10 +675,15 @@ class MerchantModeWindow(PluginWindow):
         export = QPushButton("Export macro pack…", page)
         export.clicked.connect(self._on_export)
 
+        # Buttons at their own width, packed left, with the slack at the end.
+        # Three buttons stretched to a third of the window each is the shape of
+        # a dialog's footer, not of a toolbar, and it left "Fill prices" three
+        # times the size of its label — which reads as three times the weight.
         buttons = QHBoxLayout()
         buttons.addWidget(load)
         buttons.addWidget(fill)
         buttons.addWidget(export)
+        buttons.addStretch(1)
 
         # Two different gestures for the same complaint, and the difference is
         # the whole point. Remove crops this copy of the dump; Filter writes a
@@ -655,10 +709,18 @@ class MerchantModeWindow(PluginWindow):
         )
         self._show_filtered.toggled.connect(self._on_show_filtered)
 
+        # The checkbox sits with the picker, not with the buttons: both decide
+        # what the table shows, while the buttons change what is in it. Mixed
+        # into the button row it looked like a fourth thing you could press.
+        scope = QHBoxLayout()
+        scope.addWidget(QLabel("Character", page))
+        scope.addWidget(self._character_picker)
+        scope.addStretch(1)
+        scope.addWidget(self._show_filtered)
+
         row = QHBoxLayout()
         row.addWidget(remove)
         row.addWidget(hide)
-        row.addWidget(self._show_filtered)
         row.addStretch(1)
 
         # ID is a column you never read: it is the same "owned" on every row of
@@ -687,6 +749,7 @@ class MerchantModeWindow(PluginWindow):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         for column in (0, 2, 3):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        _as_ledger(self._items_table)
         self._items_table.itemChanged.connect(self._on_item_changed)
 
         self._budget = QLabel("No inventory loaded.", page)
@@ -728,13 +791,14 @@ class MerchantModeWindow(PluginWindow):
         )
         self._find_entry.textChanged.connect(self._on_find_typed)
 
-        # No Server column: every row is on the server named above the tabs, so
+        # No Server column: every row is on the server named beside the tabs, so
         # a column repeating it forty times is the ID column's mistake again.
         self._find_table = QTableWidget(0, 4, page)
         self._find_table.setHorizontalHeaderLabels(("Item", "Where", "Count", "Dumped"))
         self._find_table.verticalHeader().setVisible(False)
         self._find_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._find_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        _as_ledger(self._find_table)
         find_header = self._find_table.horizontalHeader()
         # Name and holder are both free text and both the answer; the rest take
         # only what they need.
@@ -771,6 +835,7 @@ class MerchantModeWindow(PluginWindow):
         self._dumps_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._dumps_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._dumps_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        _as_ledger(self._dumps_table)
         dumps_header = self._dumps_table.horizontalHeader()
         dumps_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         dumps_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
@@ -835,6 +900,7 @@ class MerchantModeWindow(PluginWindow):
         filter_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         for column in (0, 1, 3):
             filter_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        _as_ledger(self._filter_table)
         self._filter_table.itemChanged.connect(self._on_filter_toggled)
 
         self._filter_pattern = QLineEdit(page)
@@ -912,9 +978,17 @@ class MerchantModeWindow(PluginWindow):
         self._want_entry.returnPressed.connect(self._on_add_wanted)
         remove = QPushButton("Remove selected", page)
         remove.clicked.connect(self._on_remove_wanted)
+        # Packed left like every other button bar in the window rather than
+        # stretched the width of the list above it.
+        remove_row = QHBoxLayout()
+        remove_row.addWidget(remove)
+        remove_row.addStretch(1)
 
         self._want_list = QListWidget(page)
         self._want_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        # Banded like the tables: a WTB list is the same kind of thing, and a
+        # window where half the lists are striped looks like two windows.
+        self._want_list.setAlternatingRowColors(True)
 
         self._want_note = QLabel("", page)
         self._want_note.setWordWrap(True)
@@ -930,7 +1004,7 @@ class MerchantModeWindow(PluginWindow):
         layout = QVBoxLayout()
         layout.addWidget(self._want_entry)
         layout.addWidget(self._want_list, 1)
-        layout.addWidget(remove)
+        layout.addLayout(remove_row)
         layout.addWidget(self._want_note)
         layout.addWidget(note)
         page.setLayout(layout)
@@ -953,6 +1027,7 @@ class MerchantModeWindow(PluginWindow):
 
         self._results = QListWidget(page)
         self._results.setMinimumHeight(TABLE_FLOOR)
+        self._results.setAlternatingRowColors(True)
         self._results.currentTextChanged.connect(self._on_result_selected)
         self._results.itemActivated.connect(lambda _item: self._on_search_submitted())
 
@@ -998,6 +1073,7 @@ class MerchantModeWindow(PluginWindow):
         self._detail_seen.setHorizontalHeaderLabels(("When", "Price", "Side", "Seller"))
         self._detail_seen.verticalHeader().setVisible(False)
         self._detail_seen.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _as_ledger(self._detail_seen)
         self._detail_seen.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Stretch
         )
@@ -1008,6 +1084,10 @@ class MerchantModeWindow(PluginWindow):
         seen_box.setLayout(seen_layout)
 
         detail_layout = QVBoxLayout()
+        # The splitter and the page layout already inset this column from the
+        # window edge; a third margin here is spacing paid twice, and on a
+        # panel this tall it is 18px of the window's minimum height.
+        detail_layout.setContentsMargins(0, 0, 0, 0)
         detail_layout.addWidget(self._detail_title)
         detail_layout.addWidget(self._detail_chart)
         detail_layout.addWidget(self._detail_table)
@@ -1029,6 +1109,7 @@ class MerchantModeWindow(PluginWindow):
         self._prices_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Stretch
         )
+        _as_ledger(self._prices_table)
         self._prices_table.itemSelectionChanged.connect(self._on_feed_selected)
         self._prices_empty = QLabel(
             "Nothing auctioned yet — this fills in as nParse+ parses /auction traffic.", page
@@ -1108,11 +1189,6 @@ class MerchantModeWindow(PluginWindow):
             self._character_picker.setCurrentIndex(index if index >= 0 else 0)
         finally:
             self._character_picker.blockSignals(False)
-
-        self._server_note.setText(
-            f"Scopes every tab: {_server_label(self._current_server())} prices, "
-            "holdings and auctions. Items can't cross servers."
-        )
 
     def _current_server(self) -> str:
         return str(self._server_picker.currentData() or "")
