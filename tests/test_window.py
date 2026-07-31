@@ -19,7 +19,7 @@ pytest.importorskip("PySide6", reason="Qt not installed (SDK-only environment)")
 pytest.importorskip("nparseplus", reason="host app not installed")
 
 from nparseplus.config.settings import Settings
-from nparseplus_sdk.plugin import PluginWindowContext
+from nparseplus_sdk import PluginWindowContext
 from nparseplus_sdk.testing import FakePluginContext
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (

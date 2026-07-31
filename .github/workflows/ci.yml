@@ -19,10 +19,10 @@ jobs:
           python-version: "3.12"
       - name: Install SDK + test deps
         run: |
-          # NOTE: `nparseplus-sdk` is not on PyPI yet, so it comes from the
-          # app repo's `sdk/` subdirectory. Once it IS published, replace the
-          # line below with: python -m pip install "nparseplus-sdk>=1.0,<2"
-          python -m pip install "nparseplus-sdk @ git+https://github.com/prokopto-dev/nparse-plus@master#subdirectory=sdk"
+          # From PyPI, matching PluginMeta.requires_sdk: CI should refuse the
+          # same SDK versions the app would, rather than testing against
+          # whatever the app repo's master branch holds today.
+          python -m pip install "nparseplus-sdk>=1.0,<2"
           python -m pip install pytest
       # Deliberately SDK-only: nParse+ itself is not installed here, so the
       # lazy host re-exports (nparseplus_sdk.events/.timers) raise ImportError.

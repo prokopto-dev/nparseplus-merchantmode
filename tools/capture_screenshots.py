@@ -277,7 +277,7 @@ def build_plugin(tmp_dir: Path):
 def build_window(plugin, ctx):
     from nparseplus.config.settings import Settings
     from nparseplus.ui import theme
-    from nparseplus_sdk.plugin import PluginWindowContext
+    from nparseplus_sdk import PluginWindowContext
 
     theme.set_theme("dark")
     spec = ctx.windows[0]
