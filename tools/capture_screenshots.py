@@ -42,7 +42,10 @@ sys.path.insert(0, str(REPO_ROOT))
 NOW = datetime(2026, 7, 30, 21, 0, 0)
 
 # PluginWindow is translucent, so a grab has an alpha channel; compositing over
-# a solid panel colour is what makes the rounded corners look right.
+# a solid colour is what keeps a partly-transparent widget from saving as a
+# checkerboard. The merchant window now fills itself with an opaque panel and
+# so covers this entirely — it still backs the settings page, and it is what
+# any future translucent shot would land on.
 PANEL_BACKDROP = "#1b1d23"
 
 # Tall enough for the Sell tab's scope pickers and status line, and for the

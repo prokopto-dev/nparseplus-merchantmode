@@ -153,7 +153,7 @@ class MerchantModePlugin(NParsePlugin):
     meta = PluginMeta(
         id="merchant-mode",
         name="Merchant Mode",
-        version="0.4.0",
+        version="0.4.1",
         description=(
             "Turn your inventory into linkable WTS auction macros, find which "
             "mule is holding what, look up what anything is worth, and see how "
