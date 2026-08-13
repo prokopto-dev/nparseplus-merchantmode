@@ -25,6 +25,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QInputDialog,
     QMessageBox,
     QSpinBox,
@@ -274,6 +275,63 @@ def test_the_staleness_threshold_round_trips_through_settings(built) -> None:
     page.findChild(QSpinBox, "stale_days").setValue(3)
     ctx.settings_pages[0].apply(page)
     assert plugin.settings()["stale_days"] == 3
+
+
+def test_the_pricing_policy_round_trips_through_settings(built) -> None:
+    """The rounding dropdown is the page's only QComboBox, and its read loop
+    was the fourth one — a page that builds but never reads back looks like a
+    setting that silently refuses to stick."""
+    from merchant_mode.pricing import Rounding
+
+    plugin, ctx, _window = built
+    page = ctx.settings_pages[0].builder(None)
+    page.findChild(QSpinBox, "markup_percent").setValue(15)
+    combo = page.findChild(QComboBox, "rounding")
+    combo.setCurrentIndex(combo.findData(Rounding.HUNDRED))
+    ctx.settings_pages[0].apply(page)
+
+    assert plugin.pricing_policy() == (15, Rounding.HUNDRED)
+
+
+def test_the_settings_page_opens_showing_the_policy_in_force(built) -> None:
+    from merchant_mode.pricing import Rounding
+
+    plugin, ctx, _window = built
+    plugin.apply_settings({"markup_percent": 20, "rounding": "500"})
+    page = ctx.settings_pages[0].builder(None)
+
+    assert page.findChild(QSpinBox, "markup_percent").value() == 20
+    # Qt hands the value back as a plain str, which is exactly why Rounding is
+    # a StrEnum and why _clamp_rounding takes str(value).
+    assert page.findChild(QComboBox, "rounding").currentData() == Rounding.FIVE_HUNDRED
+
+
+def test_an_adjusted_price_says_so_on_the_tab_that_fills_it(built) -> None:
+    """A markup is invisible once it's in the price box; the status line is
+    where the seller finds out the number is partly theirs."""
+    plugin, _ctx, window = built
+    window._render_budget()
+    assert "market" not in window._budget.text()
+
+    plugin.apply_settings({"markup_percent": 15, "rounding": "100"})
+    window._render_budget()
+    assert "filling at market +15%, rounded to the nearest 100" in window._budget.text()
+
+
+def test_the_market_tab_quotes_the_same_number_the_sell_tab_fills(built) -> None:
+    """It reads record.best() directly, so it needs the adjustment applied
+    here too — two tabs disagreeing about one item's price is the bug."""
+    plugin, _ctx, window = built
+    plugin._apply_prices([_FakeItemPrice("Cloak of Flames", 11621, 1000)])
+    plugin.apply_settings({"markup_percent": 15, "rounding": "100"})
+
+    window._detail_name = "Cloak of Flames"
+    window._render_detail()
+    note = window._detail_note.text()
+    assert "Suggested: 1.2k" in note
+    assert "+15%, nearest 100" in note
+    # The window averages are evidence, not an ask — they stay untouched.
+    assert window._detail_table.item(0, 2).text() == "1,000pp"
 
 
 def test_reloading_a_dump_from_the_dumps_tab_re_reads_the_file(built, tmp_path) -> None:

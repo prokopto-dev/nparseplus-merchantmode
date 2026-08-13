@@ -19,13 +19,17 @@ is no combined view of it anywhere:
 | `/auc` sightings (`Observation.server`) | A Blue ask is not evidence about a Green price |
 | The `NameMatcher` | Two items sharing an acronym across servers is not a real ambiguity |
 
-Three things are deliberately **not** split, and each has a reason that is
-about items rather than about markets:
+Four things are deliberately **not** split, and each has a reason that is about
+items — or about you — rather than about markets:
 
 - **Item ids** (`catalog.py`) — the game assigns them globally.
 - **The filter list** (`filters.py`) — junk is junk on every server.
 - **The item-name index** (`itemnames.py`) — an item's *existence* is a fact
   about the game; only its price and location are facts about a market.
+- **The markup and rounding** (`pricing.py`, `pricing_policy()`) — these are
+  facts about *how you price*, not about any market. You don't undercut on Blue
+  and gouge on Green because the item moved; you price the way you price.
+  Account-wide on purpose, following the `ItemFilters` precedent.
 
 Plus one UI exception: the **Dumps tab** lists every server's dumps, because it
 manages dumps rather than trading with them and a Blue dump you can't see is a

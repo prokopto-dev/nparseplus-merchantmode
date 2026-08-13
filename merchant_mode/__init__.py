@@ -13,11 +13,12 @@ it, and the feature isn't worth the account.
 P99 servers, so an item on Blue can never be sold to a buyer on Green: the
 inventories you can list, the prices you can quote, the auctions that count as
 evidence, the WTB list and the ticked listings are all per server, and there is
-no combined view of any of them anywhere in the plugin. Two things are
-deliberately *not* split, because they are facts about items rather than about
-markets: item ids (:mod:`merchant_mode.catalog`), which the game assigns
-globally, and the user's filter list (:mod:`merchant_mode.filters`), because
-junk is junk everywhere.
+no combined view of any of them anywhere in the plugin. Three things are
+deliberately *not* split: item ids (:mod:`merchant_mode.catalog`), which the
+game assigns globally, and the user's filter list
+(:mod:`merchant_mode.filters`), because junk is junk everywhere — both facts
+about items rather than about markets — and the markup and rounding, which are
+facts about *how you price* rather than about any market at all.
 
 Threading, per the SDK contract: :meth:`activate` runs on the GUI thread before
 the log driver starts; the ``CommsEvent`` subscription and the tick run on the
@@ -65,7 +66,14 @@ from .macros import DEFAULT_MAX_SOCIALS, DEFAULT_PREFIX, BuildResult, Listing, b
 from .market import MarketRecord
 from .matching import NameMatcher
 from .nicknames import NicknameTable
-from .pricing import Side, Suggestion, suggest
+from .pricing import (
+    DEFAULT_MARKUP_PERCENT,
+    MAX_MARKUP_PERCENT,
+    Rounding,
+    Side,
+    Suggestion,
+    suggest,
+)
 from .servers import host_drift, label_for, normalize_key, wire_for
 from .socialpack import DEFAULT_PAUSE_TENTHS, MAX_PAUSE_TENTHS, build_pack, write_pack
 
@@ -94,6 +102,11 @@ MAX_STALE_DAYS = 90
 moves and far too generous for a main, so the user gets to say — but a
 threshold of zero would mark every dump stale the moment it loaded, which is
 the same as having no warning at all."""
+
+DEFAULT_ROUNDING = Rounding.NONE
+"""Both pricing settings default to off — see ``DEFAULT_MARKUP_PERCENT`` and
+``MAX_MARKUP_PERCENT`` in :mod:`merchant_mode.pricing` for the bound. An
+upgrade must never quietly start quoting numbers the user hasn't agreed to."""
 
 MAX_PRICED_NAMES = 40
 """Cap on names sent to PigParse in one call — cadence courtesy.
@@ -193,6 +206,10 @@ class MerchantModePlugin(NParsePlugin):
         self._poll_seconds = DEFAULT_POLL_SECONDS
         self._max_socials = DEFAULT_MAX_SOCIALS
         self._stale_days = DEFAULT_STALE_DAYS
+        # How you price, not what a market says — so account-wide, like the
+        # filter list, and unlike everything a trade actually touches.
+        self._markup_percent = DEFAULT_MARKUP_PERCENT
+        self._rounding = DEFAULT_ROUNDING
         self._abbreviate = True
         self._show_ids = False
         """Whether the Sell tab keeps its ID column. Off by default: for a
@@ -959,7 +976,20 @@ class MerchantModePlugin(NParsePlugin):
                 side=side,
                 matcher=matcher,
                 server=key,
+                markup_percent=self._markup_percent,
+                rounding=self._rounding,
             )
+
+    def pricing_policy(self) -> tuple[int, Rounding]:
+        """The markup and rounding scale every ask is put through.
+
+        Account-wide and unscoped on purpose — unlike everything a trade
+        touches, this is a fact about how the seller prices rather than about
+        any one server's market. Exposed so the window can *say* what it did to
+        a number it shows without going back through :func:`suggest`.
+        """
+        with self._lock:
+            return self._markup_percent, self._rounding
 
     def suggest_prices(
         self, names: list[str], *, side: Side = Side.SELL, server: str | None = None
@@ -976,6 +1006,8 @@ class MerchantModePlugin(NParsePlugin):
                     side=side,
                     matcher=matcher,
                     server=key,
+                    markup_percent=self._markup_percent,
+                    rounding=self._rounding,
                 )
                 for name in names
             }
@@ -1000,6 +1032,11 @@ class MerchantModePlugin(NParsePlugin):
                     averages=averages,
                     matcher=matcher,
                     server=key,
+                    # No markup can turn a known price into an unknown one, but
+                    # this asks the question fill_prices answers and the two
+                    # must never be able to disagree about which rows are blank.
+                    markup_percent=self._markup_percent,
+                    rounding=self._rounding,
                 ).known
             ]
 
@@ -1026,6 +1063,8 @@ class MerchantModePlugin(NParsePlugin):
                     side=Side.SELL,
                     matcher=matcher,
                     server=key,
+                    markup_percent=self._markup_percent,
+                    rounding=self._rounding,
                 )
                 if not proposal.known or proposal.text == listing.price:
                     filled.append(listing)
@@ -1160,6 +1199,11 @@ class MerchantModePlugin(NParsePlugin):
                 "status": self._status,
                 "busy": self._in_flight > 0,
                 "stale_days": self._stale_days,
+                # Account-wide, but read here so the window redraws on the same
+                # version bump as everything else: change the markup and every
+                # price on screen has to be re-labelled, not just re-filled.
+                "markup_percent": self._markup_percent,
+                "rounding": self._rounding,
             }
 
     def resolve_id(self, name: str):
@@ -1206,6 +1250,13 @@ class MerchantModePlugin(NParsePlugin):
             )
             self._max_socials = max(1, _as_int(stored.get("max_socials"), DEFAULT_MAX_SOCIALS))
             self._stale_days = self._clamp_stale(stored.get("stale_days", DEFAULT_STALE_DAYS))
+            # Absent from every store written before this release, and the
+            # default is "change nothing" — so an upgrade quotes what it always
+            # quoted until the user says otherwise.
+            self._markup_percent = self._clamp_markup(
+                stored.get("markup_percent", DEFAULT_MARKUP_PERCENT)
+            )
+            self._rounding = self._clamp_rounding(stored.get("rounding", DEFAULT_ROUNDING))
             self._abbreviate = bool(stored.get("abbreviate", True))
             self._show_ids = bool(stored.get("show_ids", False))
             self._prefix = str(stored.get("prefix") or DEFAULT_PREFIX)
@@ -1261,6 +1312,11 @@ class MerchantModePlugin(NParsePlugin):
                 "poll_seconds": self._poll_seconds,
                 "max_socials": self._max_socials,
                 "stale_days": self._stale_days,
+                "markup_percent": self._markup_percent,
+                # str(): a StrEnum member is JSON-serialisable, but storage is
+                # a file another build reads back, and "100" is a value that
+                # survives this enum being renamed.
+                "rounding": str(self._rounding),
                 "abbreviate": self._abbreviate,
                 "show_ids": self._show_ids,
                 "prefix": self._prefix,
@@ -1301,6 +1357,22 @@ class MerchantModePlugin(NParsePlugin):
     def _clamp_stale(value: object) -> int:
         return max(MIN_STALE_DAYS, min(MAX_STALE_DAYS, _as_int(value, DEFAULT_STALE_DAYS)))
 
+    @staticmethod
+    def _clamp_markup(value: object) -> int:
+        return max(0, min(MAX_MARKUP_PERCENT, _as_int(value, DEFAULT_MARKUP_PERCENT)))
+
+    @staticmethod
+    def _clamp_rounding(value: object) -> Rounding:
+        """A scale this build doesn't know becomes no rounding at all.
+
+        The safe direction: an unreadable setting leaves the market number
+        alone rather than silently applying some other scale to every price.
+        """
+        try:
+            return Rounding(str(value))
+        except ValueError:
+            return DEFAULT_ROUNDING
+
     # --- settings ----------------------------------------------------------
     def settings(self) -> dict:
         with self._lock:
@@ -1309,6 +1381,8 @@ class MerchantModePlugin(NParsePlugin):
                 "poll_seconds": self._poll_seconds,
                 "max_socials": self._max_socials,
                 "stale_days": self._stale_days,
+                "markup_percent": self._markup_percent,
+                "rounding": str(self._rounding),
                 "abbreviate": self._abbreviate,
                 "show_ids": self._show_ids,
                 "prefix": self._prefix,
@@ -1326,6 +1400,10 @@ class MerchantModePlugin(NParsePlugin):
                 self._max_socials = max(1, _as_int(values["max_socials"], self._max_socials))
             if "stale_days" in values:
                 self._stale_days = self._clamp_stale(values["stale_days"])
+            if "markup_percent" in values:
+                self._markup_percent = self._clamp_markup(values["markup_percent"])
+            if "rounding" in values:
+                self._rounding = self._clamp_rounding(values["rounding"])
             if "abbreviate" in values:
                 self._abbreviate = bool(values["abbreviate"])
             if "show_ids" in values:

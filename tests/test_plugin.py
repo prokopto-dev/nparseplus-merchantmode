@@ -859,6 +859,122 @@ def test_the_staleness_threshold_survives_a_restart() -> None:
     assert restored.settings()["stale_days"] == 3
 
 
+# --- markup and rounding ---------------------------------------------------
+
+
+def test_the_markup_and_rounding_start_out_doing_nothing() -> None:
+    """An upgrade must not quietly start quoting different prices."""
+    from merchant_mode.pricing import Rounding
+
+    plugin, _ = _activated()
+    assert plugin.settings()["markup_percent"] == 0
+    assert plugin.settings()["rounding"] == Rounding.NONE
+    assert plugin.pricing_policy() == (0, Rounding.NONE)
+
+
+def test_the_markup_goes_on_before_the_rounding_when_filling_prices() -> None:
+    """1000pp at +15% is 1150, and to the nearest 100 that's 1200.
+
+    The whole point of the pair: rounding first would have given 1000 back and
+    then marked it up to 1150, defeating both settings at once.
+    """
+    plugin, _ = _activated()
+    plugin._apply_prices([_FakeItemPrice("Manastone", 4567, 1000, samples=40)])
+    plugin.set_listings([Listing(4567, "Manastone", "")])
+
+    plugin.apply_settings({"markup_percent": 15, "rounding": "100"})
+    assert plugin.fill_prices() == 1
+    assert plugin.snapshot()["listings"][0].price == "1.2k"
+
+
+def test_the_buy_list_is_quoted_at_market_however_the_markup_is_set() -> None:
+    """A markup on what you offer to pay is an offer to overpay."""
+    from merchant_mode.pricing import Side
+
+    plugin, _ = _activated()
+    plugin.set_server("green")
+    plugin.observe_auction("WTB Manastone 40k", timestamp=T0, sender="Someone")
+    plugin.apply_settings({"markup_percent": 25, "rounding": "1000"})
+
+    assert plugin.suggest_price("Manastone", side=Side.BUY).price == 40000
+    assert plugin.suggest_price("Manastone", side=Side.SELL).price == 50000
+
+
+def test_an_adjusted_suggestion_carries_the_adjustment() -> None:
+    """Shown beside the price — an unlabelled markup reads back as evidence."""
+    plugin, _ = _activated()
+    plugin.set_server("green")
+    plugin.observe_auction("WTS Manastone 40k", timestamp=T0, sender="Someone")
+    plugin.apply_settings({"markup_percent": 10, "rounding": "1000"})
+
+    proposal = plugin.suggest_price("Manastone")
+    assert proposal.adjusted == "+10%, nearest 1000"
+    assert proposal.provenance.endswith("+10%, nearest 1000")
+
+
+def test_the_markup_and_rounding_are_clamped_to_something_useful() -> None:
+    from merchant_mode.pricing import MAX_MARKUP_PERCENT, Rounding
+
+    plugin, _ = _activated()
+    plugin.apply_settings({"markup_percent": -5})
+    assert plugin.settings()["markup_percent"] == 0
+    plugin.apply_settings({"markup_percent": 9999})
+    assert plugin.settings()["markup_percent"] == MAX_MARKUP_PERCENT
+    # A scale this build doesn't know leaves the market number alone rather
+    # than applying some other scale to every price on screen.
+    plugin.apply_settings({"rounding": "42"})
+    assert plugin.settings()["rounding"] == Rounding.NONE
+
+
+def test_the_markup_and_rounding_survive_a_restart() -> None:
+    from merchant_mode.pricing import Rounding
+
+    plugin, ctx = _activated()
+    plugin.apply_settings({"markup_percent": 15, "rounding": "500"})
+    plugin.deactivate()
+
+    restored = create_plugin()
+    restored.activate(FakePluginContext(MerchantModePlugin.meta, storage=ctx.storage))
+    assert restored.settings()["markup_percent"] == 15
+    assert restored.pricing_policy() == (15, Rounding.FIVE_HUNDRED)
+
+
+def test_the_markup_and_rounding_are_account_wide() -> None:
+    """Facts about how you price, not about a market — so no server key.
+
+    Everything a trade touches is split by server because items can't cross;
+    the seller's own policy is not one of those things, so setting it once
+    reaches both servers' asks.
+    """
+    plugin, _ = _activated()
+    plugin.set_server("blue")
+    plugin.observe_auction("WTS Manastone 40k", timestamp=T0, sender="Blue seller")
+    plugin.set_server("green")
+    plugin.observe_auction("WTS Manastone 60k", timestamp=T0, sender="Green seller")
+    plugin.apply_settings({"markup_percent": 10})
+
+    assert plugin.suggest_price("Manastone", server="blue").price == 44000
+    assert plugin.suggest_price("Manastone", server="green").price == 66000
+
+
+def test_the_window_sees_the_pricing_policy_it_has_to_label() -> None:
+    from merchant_mode.pricing import Rounding
+
+    plugin, _ = _activated()
+    plugin.apply_settings({"markup_percent": 15, "rounding": "100"})
+    state = plugin.snapshot()
+    assert state["markup_percent"] == 15
+    assert state["rounding"] is Rounding.HUNDRED
+
+
+def test_changing_the_pricing_policy_makes_the_window_redraw() -> None:
+    """The prices on screen have to be re-labelled, not just refilled."""
+    plugin, _ = _activated()
+    before = plugin.snapshot()["version"]
+    plugin.apply_settings({"markup_percent": 15})
+    assert plugin.snapshot()["version"] > before
+
+
 def test_chart_for_pulls_pigparse_and_the_live_feed_together() -> None:
     plugin, _ = _activated()
     plugin._apply_prices([_FakeItemPrice("Cloak of Flames", 11621, 5000, samples=40)])
