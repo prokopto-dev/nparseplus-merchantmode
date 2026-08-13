@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from merchant_mode.inventory import (
+    ORIGIN_HOST,
+    ORIGIN_MANUAL,
     STALE_AFTER,
     CharacterInventory,
     InventoryItem,
@@ -137,6 +139,29 @@ def test_vault_round_trips_through_storage() -> None:
     assert holding.character == "Xantik"
     assert holding.item.location == "Back"
     assert holding.captured_at == T0
+
+
+def test_how_a_dump_arrived_survives_storage() -> None:
+    vault = InventoryVault()
+    vault.put("Xantik", "green", [item("Fungi Tunic", 2735)], captured_at=T0, origin=ORIGIN_HOST)
+    restored = InventoryVault.from_dict(vault.to_dict())
+    assert restored.get("Xantik", "green").origin == ORIGIN_HOST
+
+
+def test_a_stored_dump_with_no_origin_was_loaded_by_hand() -> None:
+    # Storage written before the host had a dump library. There is no guesswork
+    # in it: the file dialog was the only way a dump could get in.
+    restored = InventoryVault.from_dict(
+        {
+            "xantik@green": {
+                "character": "Xantik",
+                "server": "green",
+                "captured_at": T0.isoformat(),
+                "items": [],
+            }
+        }
+    )
+    assert restored.get("Xantik", "green").origin == ORIGIN_MANUAL
 
 
 def test_malformed_storage_is_skipped_not_fatal() -> None:

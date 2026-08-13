@@ -60,7 +60,7 @@ from PySide6.QtWidgets import (
 from .catalog import IdStatus
 from .chartdata import PriceChart
 from .filters import SUGGESTED_RULES, Action, FilterRule, Match
-from .inventory import character_from_filename
+from .inventory import ORIGIN_HOST, ORIGIN_MANUAL, character_from_filename, origin_label
 from .itemlink import raw_len
 from .macros import Listing
 from .market import WINDOWS
@@ -100,6 +100,17 @@ never read. What is worth knowing is the one case where the sources disagree,
 because a wrong id fails *silently*: the link shows the right name and only
 opens the wrong item when the buyer clicks it. So the exception gets a mark and
 a tooltip, and the column is off unless you ask for it in settings."""
+
+ORIGIN_TOOLTIPS = {
+    ORIGIN_MANUAL: "Loaded from a file you picked, on the Sell tab.",
+    ORIGIN_HOST: (
+        "Arrived on its own: nParse+ watches your EQ directory, files every "
+        "/outputfile dump it sees, and this was read from the copy it stored."
+    ),
+}
+"""Why a dump is here, on the row that is here because of it. A row nobody
+asked for is one the reader has no reason to trust until it says where it came
+from — and the Source column is a two-word answer, so the rest is a tooltip."""
 
 UNKNOWN_SERVER = "Unfiled (no server)"
 """Label for dumps that carry no server — v2 storage, or a dump loaded before
@@ -834,9 +845,11 @@ class MerchantModeWindow(PluginWindow):
         """
         page = QWidget(self)
 
-        self._dumps_table = QTableWidget(0, 5, page)
+        # Source last, and never absent: dumps now arrive without being asked
+        # for, and a row that turned up on its own has to say so.
+        self._dumps_table = QTableWidget(0, 6, page)
         self._dumps_table.setHorizontalHeaderLabels(
-            ("Character", "Server", "Items", "Dumped", "Age")
+            ("Character", "Server", "Items", "Dumped", "Age", "Source")
         )
         self._dumps_table.verticalHeader().setVisible(False)
         self._dumps_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -846,7 +859,7 @@ class MerchantModeWindow(PluginWindow):
         dumps_header = self._dumps_table.horizontalHeader()
         dumps_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         dumps_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        for column in (1, 2, 4):
+        for column in (1, 2, 4, 5):
             dumps_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
 
         reload_button = QPushButton("Reload selected", page)
@@ -1625,6 +1638,10 @@ class MerchantModeWindow(PluginWindow):
                 age.setForeground(warning)
             self._dumps_table.setItem(row, 4, age)
 
+            source = _read_only(origin_label(record.origin))
+            source.setToolTip(ORIGIN_TOOLTIPS.get(record.origin, ""))
+            self._dumps_table.setItem(row, 5, source)
+
             if (record.character, record.server) == selected:
                 self._dumps_table.selectRow(row)
 
@@ -1632,19 +1649,29 @@ class MerchantModeWindow(PluginWindow):
         days = max(1, round(after.total_seconds() / 86400))
         threshold = _plural(days, "day")
         if not records:
-            self._dumps_summary.setText("No inventory loaded — load a dump on the Sell tab.")
+            summary = "No inventory loaded — dump in game, or load a file on the Sell tab."
         elif stale_count:
-            self._dumps_summary.setText(
+            summary = (
                 f"{stale_count} of {_plural(len(records), 'dump')} "
                 f"{'is' if stale_count == 1 else 'are'} over {threshold} old. "
                 "Reload one and its bag slots are facts again."
             )
         elif len(records) == 1:
-            self._dumps_summary.setText(f"The one loaded dump is under {threshold} old.")
+            summary = f"The one loaded dump is under {threshold} old."
         else:
-            self._dumps_summary.setText(
-                f"All {_plural(len(records), 'dump')} are under {threshold} old."
+            summary = f"All {_plural(len(records), 'dump')} are under {threshold} old."
+
+        # Said out loud rather than left to the column, because "where did
+        # these come from" is the first question a list you didn't build
+        # yourself raises, and it is the whole difference between a plugin
+        # that watches your bags and one that reads a file you handed it.
+        automatic = sum(1 for record in records if record.origin == ORIGIN_HOST)
+        if automatic:
+            summary += (
+                f" {_plural(automatic, 'dump')} came in from nParse+'s dump "
+                "watcher — see the Source column."
             )
+        self._dumps_summary.setText(summary)
 
     def _selected_dump(self) -> tuple[str, str] | None:
         """``(character, server)`` for the selected row, or ``None``."""

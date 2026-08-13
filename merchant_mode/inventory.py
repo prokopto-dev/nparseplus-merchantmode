@@ -14,10 +14,17 @@ not public API, so this is an independent parser. It matches that one's proven
 handling (strict-but-partial header check, silent skip of malformed rows,
 hyphen-stripped location keys) and adds only what selling needs: keeping the
 raw location string for bag grouping, and dropping unsellable rows.
+
+Since nParse+ 2.1.0 the host watches the EQ directory itself and files every
+dump away as a JSON snapshot. Those snapshots say exactly what the tab-separated
+file said, so :func:`parse_snapshot_file` reads one into the same
+:class:`InventoryItem` rows rather than growing a second model — see
+:data:`SNAPSHOT_SCHEMA_VERSION` for what "exactly" is pinned against.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -117,6 +124,84 @@ def parse_inventory_file(path: Path | str, *, encoding: str = "utf-8") -> list[I
     return parse_inventory_text(text)
 
 
+# --------------------------------------------------------------------------- #
+# The host's stored snapshots
+# --------------------------------------------------------------------------- #
+SNAPSHOT_SCHEMA_VERSION = 1
+"""The ``CharacterDump`` layout this reader was written against (nParse+ 2.1.0).
+
+A document stamped higher was written by a newer host, where the same field
+names may not mean the same things, so it is left alone rather than half-read.
+The host's own loader refuses it for the same reason — and the failure this
+plugin designs against is a confident mistake, not a miss: a bag slot read out
+of a shape that changed is worse than no row at all, and the *Load inventory
+dump…* button still reads the game's file directly.
+"""
+
+SNAPSHOT_INVENTORY = "inventory"
+"""``DumpKind.INVENTORY``'s wire value. The other kind is a spellbook, and
+there is nothing in a spellbook to sell."""
+
+
+def parse_snapshot_document(data: object) -> list[InventoryItem]:
+    """Items out of one stored ``/outputfile inventory`` snapshot.
+
+    The host's dump library is not plugin API — ``PluginContext`` exposes no
+    dumps — so what a plugin gets is a path on an event and the stdlib to read
+    it with. The document is a JSON object carrying ``schema_version``, the
+    character's identity and ``items[]`` rows of ``location_name, name,
+    item_id, count, slots``: the same five fields the tab-separated dump has,
+    which is why this maps onto :class:`InventoryItem` instead of introducing a
+    second model of an inventory.
+
+    Malformed rows are skipped rather than raising, for the same reason
+    :func:`parse_inventory_text` skips them: one odd row must not cost the user
+    the other two hundred.
+    """
+    if not isinstance(data, dict):
+        return []
+    try:
+        version = int(data.get("schema_version", SNAPSHOT_SCHEMA_VERSION))
+    except (TypeError, ValueError):
+        return []
+    if version > SNAPSHOT_SCHEMA_VERSION:
+        return []
+
+    items: list[InventoryItem] = []
+    for row in data.get("items") or ():
+        if not isinstance(row, dict):
+            continue
+        try:
+            items.append(
+                InventoryItem(
+                    # ``location_name`` is the dump file's own label, dash and
+                    # all (``General1-Slot1``). Its sibling ``location`` is a
+                    # wire ordinal that cannot spell one and flattens anything
+                    # the client's enum never had to ``Unknown``.
+                    location=str(row.get("location_name", "")).strip(),
+                    name=str(row["name"]).strip(),
+                    item_id=int(row["item_id"]),
+                    count=int(row.get("count", 1)),
+                    slots=int(row.get("slots", 0)),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return items
+
+
+def parse_snapshot_file(path: Path | str, *, encoding: str = "utf-8") -> list[InventoryItem]:
+    """Read one stored snapshot. Missing, unreadable or not JSON yields ``[]``."""
+    try:
+        text = Path(path).read_text(encoding=encoding, errors="replace")
+    except OSError:
+        return []
+    try:
+        return parse_snapshot_document(json.loads(text))
+    except ValueError:
+        return []
+
+
 def character_from_filename(path: Path | str) -> str:
     """Guess the character name from ``<Character>-Inventory.txt``.
 
@@ -162,6 +247,30 @@ def humanize_age(age: timedelta) -> str:
     return f"{max(1, age.seconds // 3600)}h"
 
 
+ORIGIN_MANUAL = "manual"
+"""A dump the user went and fetched: the file dialog, or a reload of it."""
+
+ORIGIN_HOST = "host"
+"""A dump nParse+ noticed and handed over, with nobody asking.
+
+Worth recording because a row that appeared on its own is a row the reader
+never chose, and an unexplained row is one they have no reason to trust. The
+Dumps tab names the origin of every dump it lists.
+"""
+
+_ORIGIN_LABELS = {ORIGIN_MANUAL: "By hand", ORIGIN_HOST: "Automatic"}
+
+
+def origin_label(origin: str) -> str:
+    """How a dump got here, in the two words the Dumps tab has room for.
+
+    An origin this build has never heard of — a store written by a later
+    version and opened by this one — reads as unknown rather than being
+    rounded down to "by hand", which would be a claim nothing supports.
+    """
+    return _ORIGIN_LABELS.get(origin) or "Unknown"
+
+
 @dataclass(frozen=True)
 class CharacterInventory:
     """One character's dump, and when it was taken."""
@@ -177,6 +286,8 @@ class CharacterInventory:
     Kept as a string rather than a ``Path`` because it round-trips through JSON
     and may well name a file that no longer exists.
     """
+    origin: str = ORIGIN_MANUAL
+    """Which way it arrived — :data:`ORIGIN_MANUAL` or :data:`ORIGIN_HOST`."""
 
     @property
     def key(self) -> str:
@@ -255,6 +366,7 @@ class InventoryVault:
         *,
         captured_at: datetime,
         source_path: str = "",
+        origin: str = ORIGIN_MANUAL,
     ) -> CharacterInventory:
         """Record (or replace) one character's dump."""
         record = CharacterInventory(
@@ -263,6 +375,7 @@ class InventoryVault:
             captured_at=captured_at,
             items=list(items),
             source_path=source_path,
+            origin=origin,
         )
         self._by_key[record.key] = record
         return record
@@ -297,6 +410,7 @@ class InventoryVault:
                 captured_at=record.captured_at,
                 items=kept,
                 source_path=record.source_path,
+                origin=record.origin,
             )
         return removed
 
@@ -331,6 +445,7 @@ class InventoryVault:
                 "server": record.server,
                 "captured_at": record.captured_at.isoformat(),
                 "source_path": record.source_path,
+                "origin": record.origin,
                 "items": [
                     {
                         "location": item.location,
@@ -380,6 +495,10 @@ class InventoryVault:
                 captured_at=captured_at,
                 items=items,
                 source_path=str(raw.get("source_path", "") or ""),
+                # A store written before the host had a dump library has no
+                # origin, and there is no guesswork in reading it as by hand:
+                # the file dialog was the only way a dump could get in.
+                origin=str(raw.get("origin", "") or ORIGIN_MANUAL),
             )
         return vault
 

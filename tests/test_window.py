@@ -9,6 +9,7 @@ keeping every other test Qt-free. Run locally with the app installed:
 
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 from datetime import datetime
 from unittest.mock import patch
@@ -225,6 +226,47 @@ def test_a_stale_dump_is_flagged_in_the_dumps_tab(built) -> None:
     # The fixture's dump is written now, so make the threshold the thing that
     # moves rather than the file — same code path, no clock games.
     assert "under 1 day" in window._dumps_summary.text()
+
+
+def test_every_dump_row_says_where_it_came_from(built, tmp_path) -> None:
+    """A row nobody asked for has to account for itself.
+
+    The fixture's dump was loaded from a file; the second one arrives the way
+    the host's dump watcher delivers them, and the two must not look alike.
+    """
+    plugin, _ctx, window = built
+    assert window._dumps_table.item(0, 5).text() == "By hand"
+
+    snapshot = tmp_path / "abc123.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "character": "Mulebank",
+                "kind": "inventory",
+                "items": [
+                    {
+                        "location_name": "General1-Slot1",
+                        "name": "Manastone",
+                        "item_id": 4567,
+                        "count": 1,
+                        "slots": 0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    plugin.ingest_dump_snapshot(snapshot, character="Mulebank", digest="abc123")
+    window._rendered_version = -1
+    window.refresh()
+
+    sources = {
+        window._dumps_table.item(row, 0).text(): window._dumps_table.item(row, 5).text()
+        for row in range(window._dumps_table.rowCount())
+    }
+    assert sources == {"Xantik": "By hand", "Mulebank": "Automatic"}
+    assert "dump watcher" in window._dumps_summary.text()
 
 
 def test_forgetting_needs_a_selected_row(built) -> None:

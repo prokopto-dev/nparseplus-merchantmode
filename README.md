@@ -46,10 +46,20 @@ because it manages the dumps themselves rather than trading with them.
 
 ![The Sell tab: a character picker above items pooled from two characters, the Where column naming which alt holds each one, a stale dump flagged, a disputed item ID marked in red, and the byte budget at 250 of 255](assets/screenshots/window--sell.png)
 
-Dumps **accumulate**. Load one per character and they pool into a single
-sellable list, because a merchant advertises for the whole account — not just
-whoever happens to be logged in. Re-loading a character replaces only that
-character's entry.
+Dumps **accumulate**. One per character pools into a single sellable list,
+because a merchant advertises for the whole account — not just whoever happens
+to be logged in. A second dump for a character replaces only that character's
+entry.
+
+You mostly won't load them. nParse+ watches your EQ directory and files every
+`/outputfile inventory` away as it appears, and Merchant Mode takes each one as
+it lands: type the command on six mules and six inventories are on the Sell tab
+about twenty seconds later, with no file dialog in between. *Load inventory
+dump…* is still there for the dumps it never saw — a backup, another machine's
+file, or a directory the host isn't watching — and the [Dumps
+tab](#dumps--how-old-is-any-of-this) says which of your dumps arrived which way.
+The watching is the host's Character Dumps library, which arrived in nParse+
+**2.1.0**; that is the oldest app this plugin installs into.
 
 Within the chosen server the list is scoped **by character**, with *All
 characters* for everything there. A dump loaded with EQ closed asks which server
@@ -219,6 +229,12 @@ timestamp is what you check when the relative age looks wrong. Anything past
 your threshold is flagged, and the count is repeated on the Sell tab's status
 line — a warning you have to open a panel to find is a warning you meet after
 the mistake.
+
+**Source** says how each dump got here: `Automatic` for one nParse+ noticed and
+handed over, `By hand` for one you picked out of a dialog or reloaded. Rows now
+appear without anyone asking for them, and a row you didn't ask for is one you
+have no reason to trust until it accounts for itself; the summary line repeats
+the count.
 
 **Reload selected** re-reads a dump from the file it came from. Seeing a stale
 row is exactly the moment you want that, and having to re-find the file in a
@@ -413,9 +429,11 @@ rather than being dropped. Set the pause to `0` in settings to get all five back
 1. In game: `/outputfile inventory` — this writes `<Character>-Inventory.txt`
    into your EQ folder. Do it on **each** character you sell from; the dumps
    pool rather than replace one another.
-2. Pick your **server** at the top of the window — it scopes every tab.
-3. **Sell** tab → *Load inventory dump…* (once per character) → tick what you're
-   selling.
+2. Pick your **server** at the top of the window — it scopes every tab, and it
+   is what an arriving dump gets filed under.
+3. **Sell** tab → tick what you're selling. The dumps are already there: nParse+
+   watches the EQ folder and hands each one over within about twenty seconds.
+   *Load inventory dump…* is for the files it never saw.
 4. Right-click the junk → *Filter out* the first time through. You do it once;
    every dump after that arrives already tidy.
 5. *Fill prices* for the blanks, and type over anything you disagree with.
