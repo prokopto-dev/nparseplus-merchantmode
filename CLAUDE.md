@@ -72,6 +72,28 @@ Nothing that prices, lists or advertises an item may call it.
   shape that changed is worse than no row at all. Field names are asserted
   against the host's own writer in `tests/test_host_events.py`, which skips
   wherever the app isn't installed — including CI.
+- **`chrome.py` is a copy of the host's design tokens, and copies drift.** The
+  token layer (`nparseplus/ui/theme.py`, `skins.py`, `chrome.py`) is
+  host-internal — not re-exported by the SDK, which exports `PluginWindow` and
+  nothing else, and `PluginWindow` applies no styling — so the values are
+  mirrored here instead. Three rules follow. Every constant names the upstream
+  file and line it came from. `tests/test_chrome.py` pins the values *literally*
+  rather than recomputing them, so a host repaint is a failing assertion and a
+  readable diff instead of a window quietly wearing last year's gold; updating
+  that file is how you accept a change. And read upstream with `git -C
+  <checkout> show origin/master:src/nparseplus/ui/<file>` rather than importing
+  it — `tests/test_imports.py` fails such an import on sight.
+  Typography is always a multiple of `general.font_size`, never px.
+- **The skin-change hook is duck-typed, and that is the whole integration.** On
+  a skin change the host calls `apply_chrome()` on every surface that has one,
+  plugin windows included (`app.py:300-308`), each inside its own
+  `suppress(Exception)`. So `MerchantModeWindow.apply_chrome()` is zero-arg,
+  reads `window_context.settings.general` defensively (it is typed `Any` and has
+  no `general` under a bare double), and is called at the end of `__init__`
+  *before* `restore_visibility()` — the host's own ConsoleWindow ordering, so a
+  window is never shown undressed. The settings page is the exception that
+  proves it: it is parented into a host window that is already skinned, so it
+  sets no stylesheet and only borrows the host's object names.
 - Decisions live below the Qt line. `chartdata.py` decides what a chart should
   say; `PriceChartWidget` only puts it on screen. `finding.py` ranks; the table
   only lists. If a rule can be unit-tested without a display, it belongs there.
@@ -132,11 +154,25 @@ The README's images are real offscreen renders, not mockups:
 
 If you change the window, regenerate them, and keep the seed producing the
 states the prose claims — `tests/test_capture_screenshots.py` asserts the seed
-still yields a CONFLICT badge, a month-stale mule, a split market, and a filter
-rule of each kind. Adding a shot means adding it to `SHOTS`, to that test's
-recipe list, and to the README.
+still yields a CONFLICT badge, a month-stale mule, a split market, a filter rule
+of each kind, and one dump of each origin. Adding a shot means adding it to
+`SHOTS`, to that test's recipe list, and to the README.
+
+Two things the tool does that are not optional. `dress_app()` puts the
+QApplication in the state `nparseplus.app.create_app` leaves it — Fusion, the
+app palette, the bundled Noto Sans, the active skin — because a bare offscreen
+QApplication is *light*, and without it every shot is of a window no user has
+seen since the app's v2.0.0. And `freeze_clock()` patches `now()` in every
+`merchant_mode` module, not just the seeded timestamps: ages render at paint
+time, so freezing one end alone produces images that age on disk. Both use
+host-internal API, which is fine *here* and nowhere in `merchant_mode/` —
+`tests/test_imports.py` only scans the package.
 
 If the smoke test starts failing on the captured size, the window's *minimum*
 grew past `WINDOW_SIZE`; find the widget that did it (usually an unwrapped
 `QLabel`, whose minimum width is its whole sentence) rather than nudging the
-constant.
+constant. `SETTINGS_SIZE` is the opposite case and may be grown: the settings
+page is a form with no scroll area, so when it is too short its word-wrapped
+notes *overlap* the rows beneath rather than clipping. The number is
+`page.layout().heightForWidth(520)` plus a little air — read it off the layout
+rather than guessing.

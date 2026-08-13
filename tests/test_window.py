@@ -28,11 +28,12 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QInputDialog,
+    QLabel,
     QMessageBox,
     QSpinBox,
 )
 
-from merchant_mode import MerchantModePlugin, create_plugin
+from merchant_mode import MerchantModePlugin, chrome, create_plugin
 from merchant_mode.macros import Listing
 
 DUMP = "\n".join(
@@ -703,3 +704,85 @@ def test_right_clicking_inside_a_selection_leaves_it_alone(built) -> None:
     window._select_row_at(table.visualItemRect(table.item(0, 1)).center())
     assert len(window._selected_items()) == 2
 
+
+
+# --- chrome ------------------------------------------------------------------
+
+
+def test_the_window_dresses_itself_from_the_active_skin(built) -> None:
+    """``apply_chrome`` runs in ``__init__``, so the window is never shown bare."""
+    _plugin, _ctx, window = built
+    sheet = window.styleSheet()
+    assert sheet, "the window built itself without a stylesheet"
+    assert chrome.SKINS[Settings().general.skin].chrome_accent in sheet
+
+
+def test_the_host_can_re_dress_the_window_by_calling_a_zero_arg_hook(built) -> None:
+    """The whole skin-change integration, and it is duck-typed: on a skin change
+    the host walks its chrome surfaces and calls ``apply_chrome()`` on anything
+    that has one (``app.py:300-308``). No import, no registration — so what has
+    to hold is that the name exists, takes nothing, and repaints from settings
+    read at call time rather than at construction."""
+    _plugin, _ctx, window = built
+    window.window_context.settings.general.skin = "velious"
+    window.apply_chrome()
+
+    assert chrome.SKINS["velious"].chrome_accent in window.styleSheet()
+    assert chrome.SKINS["duxa"].chrome_accent not in window.styleSheet()
+
+
+def test_the_window_survives_settings_it_cannot_read(qt_app, tmp_path) -> None:
+    """``PluginWindowContext.settings`` is typed ``Any``.
+
+    A double that carries only what the SDK's own base class needs has no
+    ``general`` to read a skin out of, and ``apply_chrome`` runs inside
+    ``__init__`` — so a raise here would cost the window, not merely its looks.
+    """
+    settings = Settings()
+    settings.general.skin = "velious"
+    del settings.general  # the appearance half a bare double would not carry
+    assert not hasattr(settings, "general")
+
+    ctx = FakePluginContext(MerchantModePlugin.meta)
+    plugin = create_plugin()
+    plugin.activate(ctx)
+    spec = ctx.windows[0]
+    wctx = PluginWindowContext(
+        settings=settings,
+        window_key=f"plugin.merchant-mode.{spec.key}",
+        title=spec.title,
+        default_geometry=spec.default_geometry,
+        on_save=lambda: None,
+    )
+    window = spec.factory(wctx)
+    try:
+        assert window.styleSheet() == chrome.window_style()
+        assert chrome.SKINS["velious"].chrome_accent not in window.styleSheet()
+    finally:
+        window.close()
+
+
+def test_an_unknown_skin_name_still_dresses_the_window(built) -> None:
+    """A skin this plugin's mirror has never heard of is what the *next* host
+    skin looks like from here, and it must not leave the window unstyled."""
+    _plugin, _ctx, window = built
+    window.window_context.settings.general.skin = "moonstone"
+    window.apply_chrome()
+    assert chrome.SKINS[chrome.DEFAULT_SKIN].chrome_accent in window.styleSheet()
+
+
+def test_the_explanatory_paragraphs_wear_the_hosts_hint_name(built) -> None:
+    """Which is what de-emphasises them — including on the settings page, which
+    this plugin does not style at all and the host does."""
+    _plugin, ctx, window = built
+    assert window._find_note.objectName() == chrome.HINT
+    assert window._detail_title.objectName() == chrome.TITLE
+
+    page = ctx.settings_pages[0].builder(None)
+    hints = [
+        label
+        for label in page.findChildren(QLabel)
+        if label.objectName() == chrome.HINT
+    ]
+    assert len(hints) == 4, "every note under a settings control explains one"
+    assert all(label.wordWrap() for label in hints)

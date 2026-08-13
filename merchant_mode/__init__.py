@@ -208,7 +208,12 @@ class MerchantModePlugin(NParsePlugin):
     meta = PluginMeta(
         id="merchant-mode",
         name="Merchant Mode",
-        version="0.4.1",
+        # One release for three changes that all answer the same thing — the
+        # host moved on: it wears skins now, it files inventory dumps itself,
+        # and a seller wanted the asking price to be their number rather than
+        # the market's. Minor rather than patch: the window looks different, two
+        # settings are new, and dumps arrive without being asked for.
+        version="0.5.0",
         description=(
             "Turn your inventory into linkable WTS auction macros, find which "
             "mule is holding what, look up what anything is worth, and see how "
