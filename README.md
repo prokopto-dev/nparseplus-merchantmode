@@ -364,6 +364,35 @@ Prices you typed yourself are **never overwritten** by a fill; a price you chose
 is a decision, and a lookup shouldn't quietly overrule it. Suggestions land in
 an editable field, and every one shows its source.
 
+### Asking over market, in round numbers
+
+Two settings sit on top of all of that, and **both start off**: a percentage to
+ask over market, and a scale to round the asking price to.
+
+The markup goes on **first** and the rounding **second**, which is the whole
+point of having both. A market price of 1000pp at +15% is 1150, and to the
+nearest 100 that's **1200** — a number you'd actually type into `/auction`.
+Rounding first would have given you 1000 back and then marked it up to 1150,
+defeating both settings at once.
+
+Two things they deliberately don't touch:
+
+- **Your buy list.** Marking up what you offer to *pay* is an offer to overpay,
+  so WTB quotes are always the market's own number.
+- **The Market tab's figures.** The 30-day/90-day/6-month averages and the
+  observed low–median–high are evidence, and evidence doesn't get a markup.
+  Only the *Suggested* line — the one that says what to ask — is adjusted, and
+  it says so: `Suggested: 1.2k (best of 6 months, then +15%, nearest 100)`.
+
+Wherever an adjusted price appears it carries its adjustment, and the Sell tab
+says `filling at market +15%, nearest 100` on its status line while the settings
+are on. That is deliberate: a markup you can't see is one you read back next
+week as what the market is paying, and then mark up again.
+
+Unlike almost everything else here, these two are **account-wide**. Every price,
+listing and sighting is per server because items can't cross servers — but how
+you price is a fact about you, not about a market.
+
 ---
 
 ## Throttling
@@ -402,8 +431,9 @@ way there: type part of the name and it says which character, which bag slot,
 and how stale that answer is.
 
 Selling on a second server is the same routine with the picker moved: its own
-inventories, its own prices, its own buy list, its own macro pack. The only
-thing that follows you across is your filter list.
+inventories, its own prices, its own buy list, its own macro pack. What follows
+you across is only what isn't about a market — your filter list, and how much
+you ask over it.
 
 Item names can be abbreviated in the link label — `CoF` opens Cloak of Flames
 just as well as the full name does, and buys you roughly a fourth item per line.
@@ -418,6 +448,8 @@ edit.
 | Max socials per export | `4` | Overflow spills onto further buttons |
 | Price poll interval | `600 s` | PigParse cadence courtesy |
 | Warn about dumps older than | `7 days` | Advisory only; never blocks |
+| Ask over market price | `0 %` | Sell side only; applied before rounding |
+| Round the asking price to | off | 10 / 50 / 100 / 500 / 1000 plat |
 | Abbreviate item names | on | Uses the nickname table |
 | Show the item ID column | off | The disagreement that matters is marked either way |
 | Line prefix | `/auc WTS ` | Change the channel here |

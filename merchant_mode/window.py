@@ -66,7 +66,14 @@ from .macros import Listing
 from .market import WINDOWS
 from .matching import normalize
 from .packing import LINE_LIMIT
-from .pricing import Side, format_price
+from .pricing import (
+    MAX_MARKUP_PERCENT,
+    Rounding,
+    Side,
+    adjust,
+    describe_adjustment,
+    format_price,
+)
 from .servers import SERVERS, label_for, normalize_key
 from .socialpack import MAX_PAUSE_TENTHS
 
@@ -1304,7 +1311,9 @@ class MerchantModeWindow(PluginWindow):
             # What it would cost to buy one, and where that figure came from —
             # an unattributed number is one the user has to take on faith.
             proposal = self._plugin.suggest_price(name, side=Side.BUY)
-            price = f"{proposal.text} ({proposal.source.label})" if proposal.known else "—"
+            # provenance, not source.label: a buy quote is never marked up, and
+            # this is the line that would have to say so if that ever changed.
+            price = f"{proposal.text} ({proposal.provenance})" if proposal.known else "—"
             self._want_list.addItem(f"{name}  [{badge}]  {price}")
 
     def _render_prices(self, state: dict) -> None:
@@ -1320,8 +1329,10 @@ class MerchantModeWindow(PluginWindow):
 
     def _render_budget(self) -> None:
         result = self._plugin.build()
+        pricing = self._pricing_line()
         if not result.socials:
-            self._budget.setText(self._sources_line() or "Tick items to sell and give them prices.")
+            idle = " · ".join(part for part in (self._sources_line(), pricing) if part)
+            self._budget.setText(idle or "Tick items to sell and give them prices.")
             return
         widest = max(
             (raw_len(line) for social in result.socials for line in social["lines"]), default=0
@@ -1338,7 +1349,27 @@ class MerchantModeWindow(PluginWindow):
         sources = self._sources_line()
         if sources:
             parts.append(sources)
+        if pricing:
+            parts.append(pricing)
         self._budget.setText(" · ".join(parts))
+
+    def _pricing_line(self) -> str:
+        """What your own settings are doing to every price this tab fills in.
+
+        A markup is invisible once it lands in the price box — it looks exactly
+        like a number the market handed you, and next week you'd read it back
+        as one and mark it up again. Same rule that makes every suggestion
+        carry its source: nobody should have to remember which figure is theirs.
+        """
+        markup, rounding = self._plugin.pricing_policy()
+        if not markup and rounding is Rounding.NONE:
+            return ""
+        # Spelled out rather than reusing describe_adjustment's compact form:
+        # this one is a sentence on a status line, not a tag beside a number.
+        asked = f"market +{markup}%" if markup else "market"
+        if rounding is not Rounding.NONE:
+            asked += f", rounded to the {rounding.label}"
+        return f"filling at {asked}"
 
     def _sources_line(self) -> str:
         """Which characters' dumps are in play, how fresh they are, and what
@@ -1733,7 +1764,17 @@ class MerchantModeWindow(PluginWindow):
             parts = []
             if best is not None:
                 price, window = best
-                parts.append(f"Suggested: {format_price(price)} (best of {window.label})")
+                # Through the same markup and rounding the Sell tab fills with.
+                # This line reads record.best() directly rather than going via
+                # suggest(), so without this the two tabs would quote different
+                # numbers for the same item and neither would say why.
+                markup, rounding = self._plugin.pricing_policy()
+                asked = adjust(price, markup_percent=markup, rounding=rounding)
+                note = describe_adjustment(markup_percent=markup, rounding=rounding)
+                parts.append(
+                    f"Suggested: {format_price(asked)} (best of {window.label}"
+                    + (f", then {note})" if note else ")")
+                )
             if record.last_seen:
                 parts.append(f"last WTS seen {record.last_seen:%Y-%m-%d}")
             if record.fetched_at:
@@ -2211,6 +2252,32 @@ def build_settings_page(parent: QWidget | None, values: dict) -> QWidget:
     stale_note.setWordWrap(True)
     form.addRow(stale_note)
 
+    markup = QSpinBox(page)
+    markup.setRange(0, MAX_MARKUP_PERCENT)
+    markup.setSuffix(" %")
+    markup.setValue(int(values.get("markup_percent", 0)))
+    markup.setObjectName("markup_percent")
+    form.addRow("Ask over market price", markup)
+
+    rounding = QComboBox(page)
+    for scale in Rounding:
+        rounding.addItem(scale.label.capitalize(), scale)
+    current = rounding.findData(values.get("rounding", Rounding.NONE))
+    rounding.setCurrentIndex(current if current >= 0 else 0)
+    rounding.setObjectName("rounding")
+    form.addRow("Round the asking price to", rounding)
+
+    pricing_note = QLabel(
+        "Both start off, and both apply only to what you sell — a markup on "
+        "what you offer to pay is an offer to overpay. The markup goes on "
+        "first, so the round number is the one you ask: 1000pp at +15% is "
+        "1150, and 1200 to the nearest 100. An adjusted price says so wherever "
+        "it is shown.",
+        page,
+    )
+    pricing_note.setWordWrap(True)
+    form.addRow(pricing_note)
+
     abbreviate = QCheckBox("Abbreviate item names in links", page)
     abbreviate.setChecked(bool(values.get("abbreviate", True)))
     abbreviate.setObjectName("abbreviate")
@@ -2242,7 +2309,7 @@ def build_settings_page(parent: QWidget | None, values: dict) -> QWidget:
 
 def read_settings_page(page: QWidget) -> dict:
     values: dict = {}
-    for name in ("pause_tenths", "max_socials", "poll_seconds", "stale_days"):
+    for name in ("pause_tenths", "max_socials", "poll_seconds", "stale_days", "markup_percent"):
         spin = page.findChild(QSpinBox, name)
         if spin is not None:
             values[name] = int(spin.value())
@@ -2250,6 +2317,14 @@ def read_settings_page(page: QWidget) -> dict:
         check = page.findChild(QCheckBox, name)
         if check is not None:
             values[name] = bool(check.isChecked())
+    for name in ("rounding",):
+        combo = page.findChild(QComboBox, name)
+        if combo is not None:
+            # currentData, not currentText: the visible label is prose meant
+            # for a reader, and the stored value has to survive rewording it.
+            # Qt returns it as a plain str — which is why Rounding is a
+            # StrEnum and the plugin's clamp reads str(value).
+            values[name] = combo.currentData()
     prefix = page.findChild(QLineEdit, "prefix")
     if prefix is not None:
         values["prefix"] = prefix.text()
