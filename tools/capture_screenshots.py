@@ -41,11 +41,57 @@ sys.path.insert(0, str(REPO_ROOT))
 # pipeline compares naive datetimes — never introduce tz-aware values here).
 NOW = datetime(2026, 7, 30, 21, 0, 0)
 
-# PluginWindow is translucent, so a grab has an alpha channel; compositing over
-# a solid colour is what keeps a partly-transparent widget from saving as a
-# checkerboard. The merchant window now fills itself with an opaque panel and
-# so covers this entirely — it still backs the settings page, and it is what
-# any future translucent shot would land on.
+
+class FrozenClock(datetime):
+    """``datetime`` whose ``now()`` is always :data:`NOW`.
+
+    A subclass rather than a stub, because the modules this replaces the name
+    in also parse and format with it, and only ``now()`` should move.
+    """
+
+    @classmethod
+    def now(cls, tz=None):
+        return NOW
+
+
+def freeze_clock() -> None:
+    """Point every ``merchant_mode`` module's ``datetime`` at :class:`FrozenClock`.
+
+    Freezing the seed's timestamps was only ever half the job. The plugin
+    stamps a fetch time when prices arrive and the window measures every age at
+    paint time, both from ``datetime.now()`` — so the shots dated their data
+    from July and measured it from whenever the tool happened to run. Two weeks
+    after a capture the Sell tab's fresh character had silently gone stale,
+    every row grew a "(13d old)" it is not supposed to have, the Market tab
+    printed today's date as its fetch time, and the README's prose — one fresh
+    character, one mule a month gone — described a screenshot that no longer
+    showed it. A screenshot that changes when nothing changed is not a render
+    of the plugin, it is a render of the calendar.
+
+    Process-wide, which is what a one-shot capture script wants. It is still
+    paired with :func:`thaw_clock`, because the smoke tests import this module
+    into a session that goes on to run the rest of the suite — and a plugin test
+    measuring a dump's age against a July afternoon fails in a way that points
+    anywhere but here.
+    """
+    import merchant_mode.window  # noqa: F401 - imported for the patch below
+
+    for name, module in sys.modules.items():
+        if name.startswith("merchant_mode") and getattr(module, "datetime", None) is datetime:
+            module.datetime = FrozenClock
+
+
+def thaw_clock() -> None:
+    """Undo :func:`freeze_clock`. Symmetric, so it needs no bookkeeping."""
+    for name, module in sys.modules.items():
+        if name.startswith("merchant_mode") and getattr(module, "datetime", None) is FrozenClock:
+            module.datetime = datetime
+
+# A grab can carry an alpha channel (rounded corners, a widget that has not
+# filled its own background), and compositing over a solid colour is what keeps
+# those pixels from saving as a checkerboard. Deliberately not the chrome's
+# ``surface``: a backdrop identical to the window's own ground would hide a
+# window that had stopped painting one.
 PANEL_BACKDROP = "#1b1d23"
 
 # Tall enough for the Sell tab's scope pickers and status line, and for the
@@ -55,7 +101,14 @@ PANEL_BACKDROP = "#1b1d23"
 # starts failing the smoke test, the window's minimum grew: read the new number
 # off the failure rather than nudging this one until it sticks.
 WINDOW_SIZE = (700, 700)
-SETTINGS_SIZE = (520, 420)
+
+# Grown from 420 when the markup and rounding rows landed. Word-wrapped labels
+# do not clip when a form is too short, they *overlap* — every explanatory
+# paragraph reports one line as its minimum and then draws the three it needs
+# straight over the row beneath. So this is not a taste number: it is
+# ``page.layout().heightForWidth(520)``, which is 490, plus a little air. Read
+# it off the layout again rather than guessing if a control is ever added.
+SETTINGS_SIZE = (520, 500)
 
 # Top-level widgets have no QObject parent, so the only strong reference is the
 # local in each cap function. Once that drops the widget is collected, and
@@ -65,8 +118,17 @@ _ALIVE: list = []
 # Two characters, because a merchant advertises for the whole account. The mule
 # is deliberately dumped weeks ago so the Sell tab shows a staleness warning —
 # a bag slot from a month back is a guess, and the UI should say so.
+#
+# They also arrive by the two different routes, which is the Dumps tab's Source
+# column's entire reason for existing: Xantik through the file dialog, Mulebank
+# the way nParse+ now files a dump on its own. A seed where both said "By hand"
+# would leave the README claiming the tab tells them apart while showing a shot
+# in which it never does.
+BY_HAND, AUTOMATIC = "manual", "host"
+
 DUMPS = {
     "Xantik": (
+        BY_HAND,
         timedelta(hours=2),
         "\n".join(
             (
@@ -81,6 +143,7 @@ DUMPS = {
         ),
     ),
     "Mulebank": (
+        AUTOMATIC,
         timedelta(days=31),
         "\n".join(
             (
@@ -209,6 +272,36 @@ class _FakePrice:
         self.last_wts_seen = last_seen
 
 
+def _as_snapshot(character: str, text: str) -> str:
+    """The same rows, in the shape nParse+ stores a dump it filed itself.
+
+    One set of item rows for both routes: a seed that spelled the mule's bags
+    out twice would drift the moment one copy was edited, and the point of the
+    two routes here is the provenance, not the contents.
+    """
+    import json
+
+    header, *rows = (line.split("\t") for line in text.splitlines())
+    del header  # Location, Name, ID, Count, Slots — positional below
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "character": character,
+            "kind": "inventory",
+            "items": [
+                {
+                    "location_name": location,
+                    "name": name,
+                    "item_id": int(item_id),
+                    "count": int(count),
+                    "slots": int(slots),
+                }
+                for location, name, item_id, count, slots in rows
+            ],
+        }
+    )
+
+
 def build_plugin(tmp_dir: Path):
     """A plugin seeded with a dump, listings, wanted items, and price history."""
     from nparseplus_sdk.testing import FakePluginContext
@@ -217,15 +310,27 @@ def build_plugin(tmp_dir: Path):
     from merchant_mode.filters import Action, FilterRule, Match
     from merchant_mode.macros import Listing
 
+    freeze_clock()
     ctx = FakePluginContext(MerchantModePlugin.meta)
     plugin = create_plugin()
     plugin.activate(ctx)
 
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    for character, (age, text) in DUMPS.items():
-        dump = tmp_dir / f"{character}-Inventory.txt"
-        dump.write_text(text, encoding="utf-8")
-        plugin.load_dump(dump, character=character, server="green", captured_at=NOW - age)
+    for character, (origin, age, text) in DUMPS.items():
+        if origin == BY_HAND:
+            dump = tmp_dir / f"{character}-Inventory.txt"
+            dump.write_text(text, encoding="utf-8")
+            plugin.load_dump(dump, character=character, server="green", captured_at=NOW - age)
+        else:
+            # What the host hands over is a path to a stored snapshot, not the
+            # original text file — so the seed writes the document rather than
+            # calling an ingest helper with the TSV, and the plugin reads it
+            # exactly as it does in the app.
+            snapshot = tmp_dir / f"{character}-inventory.json"
+            snapshot.write_text(_as_snapshot(character, text), encoding="utf-8")
+            plugin.ingest_dump_snapshot(
+                snapshot, character=character, server="green", captured_at=NOW - age
+            )
 
     holders = {holding.name: holding for holding in plugin.holdings()}
     plugin.set_listings(
@@ -274,15 +379,55 @@ def build_plugin(tmp_dir: Path):
     return plugin, ctx
 
 
-def build_window(plugin, ctx):
-    from nparseplus.config.settings import Settings
-    from nparseplus.ui import theme
-    from nparseplus_sdk import PluginWindowContext
+def dress_app(app, settings):
+    """Put the QApplication in the state ``nparseplus.app.create_app`` leaves it.
 
-    theme.set_theme("dark")
+    Four lines, and without them every shot here is a lie. A bare offscreen
+    QApplication uses the platform's default style and its *light* palette, so
+    the screenshots this tool produced before v2.0.0 showed a light window that
+    no nParse+ user has seen since — the plugin reads its body ink out of the
+    QPalette, and offscreen that ink is black.
+
+    So: Fusion (which honours QPalette fully and identically on every platform,
+    per ``app.py:237-242``), the app palette and narrow app sheet built from the
+    active skin, and the bundled Noto Sans faces the type roles name. This is
+    host-internal API, which shipped plugin code may not touch — a dev tool that
+    runs only where the app is installed may, and using the host's real chrome
+    here rather than the plugin's mirror of it is deliberate: if
+    ``merchant_mode/chrome.py`` ever drifts, these shots are where it shows.
+    """
+    import os
+
+    from nparseplus.helpers import resource_path
+    from nparseplus.ui import chromewidgets, skins
+    from PySide6.QtGui import QFontDatabase
+
+    app.setStyle("Fusion")
+    skins.set_skin(settings.general.skin)
+    chromewidgets.apply_app_chrome(app, settings.general.font_size)
+    for face in ("NotoSans-Regular.ttf", "NotoSans-Bold.ttf"):
+        QFontDatabase.addApplicationFont(resource_path(os.path.join("data", "fonts", face)))
+
+
+def build_window(plugin, ctx):
+    """The window as the app builds it, under the app's default skin.
+
+    ``theme.set_theme("dark")`` used to stand here. nParse+ v2.0.0 deleted the
+    light theme and the function with it — there is one palette now, and the
+    skin (``settings.general.skin``, Duxa by default) is what varies. A default
+    ``Settings`` therefore already describes what a new user sees, and the
+    window dresses itself from it in ``apply_chrome``.
+    """
+    from nparseplus.config.settings import Settings
+    from nparseplus_sdk import PluginWindowContext
+    from PySide6.QtWidgets import QApplication
+
+    freeze_clock()  # again, for the window module, which loads with the factory
+    settings = Settings()
+    dress_app(QApplication.instance(), settings)
     spec = ctx.windows[0]
     wctx = PluginWindowContext(
-        settings=Settings(),
+        settings=settings,
         window_key=f"plugin.merchant-mode.{spec.key}",
         title=spec.title,
         default_geometry=spec.default_geometry,
@@ -299,7 +444,21 @@ def cap_tab(window, index: int, name: str) -> Path:
 
 
 def cap_settings(ctx, name: str = "settings--merchant-mode") -> Path:
+    """The plugin's page as it appears inside the host's Settings window.
+
+    The page itself sets no stylesheet — it is parented into a host window that
+    is already wearing one, and the host's sheet is what gives its explanatory
+    paragraphs the muted ``ChromeHint`` role. Applying that same sheet here is
+    what makes this a screenshot of the page in its window rather than of a
+    widget in a vacuum.
+    """
+    from nparseplus.config.settings import Settings
+    from nparseplus.ui import chrome, skins, theme
+
     page = _keep(ctx.settings_pages[0].builder(None))
+    page.setStyleSheet(
+        chrome.window_style(skins.skin(), theme.palette(), Settings().general.font_size)
+    )
     return capture(page, name, size=SETTINGS_SIZE)
 
 

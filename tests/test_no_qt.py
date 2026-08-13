@@ -23,6 +23,7 @@ QT_FREE_MODULES = [
     "merchant_mode.auctions",
     "merchant_mode.catalog",
     "merchant_mode.chartdata",
+    "merchant_mode.chrome",
     "merchant_mode.filters",
     "merchant_mode.finding",
     "merchant_mode.inventory",

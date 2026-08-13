@@ -31,6 +31,20 @@ def qt_app():
     yield QApplication.instance() or QApplication([])
 
 
+@pytest.fixture(autouse=True)
+def _thawed():
+    """Put the clock back after every test in this module.
+
+    ``cap.build_plugin`` freezes ``datetime.now()`` across ``merchant_mode`` so
+    the shots are dated from :data:`cap.NOW` rather than from whenever the tool
+    ran. Left frozen, that leaks into the rest of the session: the next test to
+    measure a dump's age gets one from a July afternoon and fails somewhere that
+    points nowhere near this file.
+    """
+    yield
+    cap.thaw_clock()
+
+
 def test_sell_tab_capture(qt_app, tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(cap, "OUT_DIR", tmp_path)
     plugin, ctx = cap.build_plugin(tmp_path / "seed")
@@ -81,6 +95,39 @@ def test_the_seed_spans_two_characters_with_one_going_stale(tmp_path) -> None:
     holding = plugin.locate("Rubicite Breastplate")[0]
     assert holding.character == "Mulebank"
     assert "old" in holding.where(cap.NOW)
+
+
+def test_the_dumps_shot_shows_both_ways_a_dump_arrives(tmp_path) -> None:
+    """The Dumps tab's Source column exists to tell the two apart.
+
+    If the seed ever loaded both by hand, the README would keep claiming the
+    tab says where a row came from while showing a shot in which every row says
+    the same thing.
+    """
+    from merchant_mode.inventory import ORIGIN_HOST, ORIGIN_MANUAL
+
+    plugin, _ctx = cap.build_plugin(tmp_path / "seed")
+    origins = {record.character: record.origin for record in plugin.inventories()}
+    assert origins == {"Xantik": ORIGIN_MANUAL, "Mulebank": ORIGIN_HOST}
+
+
+def test_the_shots_are_dated_from_the_frozen_clock_not_the_wall_clock(tmp_path) -> None:
+    """Otherwise a shot changes when nothing changed.
+
+    The seed dates its dumps from :data:`cap.NOW`; the window and the price
+    record read ``datetime.now()`` when they render. Freeze one and not the
+    other and the fresh character silently goes stale a week after capture.
+    """
+    from datetime import datetime
+
+    from merchant_mode import window as window_module
+
+    plugin, _ctx = cap.build_plugin(tmp_path / "seed")
+    cap.freeze_clock()
+    assert window_module.datetime.now() == cap.NOW
+    assert datetime.now() != cap.NOW, "the real clock must be left alone"
+    record = plugin.market_for("Cloak of Flames")
+    assert record.fetched_at == cap.NOW
 
 
 def test_the_sell_screenshot_shows_a_nearly_full_line_budget(tmp_path) -> None:

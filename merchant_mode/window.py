@@ -36,7 +36,6 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
-    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -59,6 +58,16 @@ from PySide6.QtWidgets import (
 
 from .catalog import IdStatus
 from .chartdata import PriceChart
+from .chrome import (
+    DARK,
+    DEFAULT_FONT_SIZE,
+    DEFAULT_SKIN,
+    HINT,
+    PAGE_MARGINS,
+    ROW_SPACING,
+    TITLE,
+    window_style,
+)
 from .filters import SUGGESTED_RULES, Action, FilterRule, Match
 from .inventory import ORIGIN_HOST, ORIGIN_MANUAL, character_from_filename, origin_label
 from .itemlink import raw_len
@@ -185,21 +194,59 @@ def _ink(widget: QWidget) -> QColor:
     return widget.palette().color(QPalette.ColorRole.WindowText)
 
 
-def _warning_colour(widget: QWidget) -> QColor:
-    """A red that survives whichever background this widget is sitting on.
+def _warning_colour() -> QColor:
+    """The red a stale dump's age is drawn in.
 
-    Same reasoning as :func:`_ink`, and the same reason it isn't a constant: a
-    warning drawn in the dark theme's red on a light panel is a warning nobody
-    reads.
+    Used to test the background's lightness and pick one of two reds, because
+    the host had a light theme and this window could find itself on either
+    ground. nParse+ v2.0.0 deleted the light theme — the app renders over
+    EverQuest, where a pale panel is a flashbang — so there is now exactly one
+    ground and exactly one red that reads on it. Taking the palette's word for
+    it is what the lightness test was avoiding, and the thing it was avoiding
+    no longer exists.
+
+    Not :func:`_ink`'s treatment, which stays palette-derived: body text is
+    whatever the application palette says it is, and that is a value the host
+    sets. A *warning* is a semantic token, and the host keeps those in
+    ``ui/theme.py`` rather than in any QPalette role.
     """
-    background = widget.palette().color(QPalette.ColorRole.Window)
-    return QColor("#ff6b5e") if background.lightness() < 128 else QColor("#c62828")
+    return QColor(DARK.warning_text)
 
 
 def _alpha(colour: QColor, alpha: int) -> QColor:
     faded = QColor(colour)
     faded.setAlpha(max(0, min(255, alpha)))
     return faded
+
+
+def _page_layout() -> QVBoxLayout:
+    """A tab page's layout, gutters and all.
+
+    The numbers are the host's (``chrome.PAGE_MARGINS`` / ``ROW_SPACING``), not
+    Qt's defaults, so a Merchant Mode tab and a Settings page are inset by the
+    same amount — which is most of what makes two windows look like one
+    program. A function rather than two lines repeated in six tab builders,
+    because the seventh would be the one that got them wrong.
+    """
+    layout = QVBoxLayout()
+    layout.setContentsMargins(*PAGE_MARGINS)
+    layout.setSpacing(ROW_SPACING)
+    return layout
+
+
+def _hint(label: QLabel) -> QLabel:
+    """Mark a label as explanatory text and hand it back.
+
+    Wearing the host's own ``ChromeHint`` name (see ``chrome.HINT``), which is
+    what drops it to the palette's muted grey at 0.9 of the body size. The point
+    is the hierarchy rather than the colour: every tab here ends in a paragraph
+    explaining what the list above it means, and set in the same ink at the
+    same size as the data, that paragraph competes with the answer the reader
+    came for.
+    """
+    label.setObjectName(HINT)
+    label.setWordWrap(True)
+    return label
 
 
 def _spread_line(chart: PriceChart) -> str:
@@ -293,7 +340,7 @@ class PriceChartWidget(QWidget):
         return _ink(self)
 
     def _warning(self) -> QColor:
-        return _warning_colour(self)
+        return _warning_colour()
 
     def _small_font(self):
         font = self.font()
@@ -551,12 +598,13 @@ class DumpDetailsDialog(QDialog):
         chosen = self._server.findData(normalize_key(server))
         self._server.setCurrentIndex(chosen if chosen >= 0 else 0)
 
-        note = QLabel(
-            "Prices are per server, so a dump without one can't be priced. "
-            "This is remembered for next time.",
-            self,
+        note = _hint(
+            QLabel(
+                "Prices are per server, so a dump without one can't be priced. "
+                "This is remembered for next time.",
+                self,
+            )
         )
-        note.setWordWrap(True)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
@@ -566,6 +614,10 @@ class DumpDetailsDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         form = QFormLayout()
+        # The dialog opens from the window and inherits its stylesheet, so it
+        # needs the gutters and nothing else.
+        form.setContentsMargins(*PAGE_MARGINS)
+        form.setSpacing(ROW_SPACING)
         form.addRow("Character", self._character)
         form.addRow("Server", self._server)
         form.addRow(note)
@@ -583,7 +635,18 @@ class MerchantModeWindow(PluginWindow):
     """Inventory picker, WTB list, and the market."""
 
     def __init__(self, wctx: Any, plugin: MerchantModePlugin) -> None:
-        super().__init__(wctx)
+        # Opaque, which for a plugin window is a one-word decision the SDK has
+        # always offered: ``PluginWindow`` defaults to translucent because the
+        # windows it was written for are spell timers floating over the game,
+        # and this one is a document you read for minutes at a time. This
+        # window used to buy the same thing by filling itself with an opaque
+        # QFrame, which worked and left the frame drawing a second border
+        # inside the host's own.
+        #
+        # ``default_state`` is deliberately not passed: it takes a host-internal
+        # ``WindowState``, so naming it here would put an un-importable type in
+        # a plugin's constructor call.
+        super().__init__(wctx, translucent=False)
         self._plugin = plugin
         self._rendered_version = -1
         self._detail_name = ""
@@ -604,27 +667,11 @@ class MerchantModeWindow(PluginWindow):
         self._filters_page = self._build_filters_tab()
         self._tabs.addTab(self._filters_page, "Filters")
 
-        # Everything sits on one opaque panel. PluginWindow is translucent by
-        # default — the right call for a spell timer floating over the game, and
-        # the wrong one for this: any text that isn't inside the tab pane (the
-        # server picker, the tab labels' own strip) was being drawn over
-        # whatever happened to be behind the window, which on a dark EverQuest
-        # night means dark grey on black. A merchant window is a document you
-        # read for minutes at a time, not a HUD you glance at, so it gets a
-        # background of its own and every label a guaranteed contrast against
-        # it. The frame is what makes the tabs read as attached to a window
-        # rather than floating in mid-air.
-        panel = QFrame(self)
-        panel.setFrameShape(QFrame.Shape.StyledPanel)
-        panel.setAutoFillBackground(True)
-        panel_layout = QVBoxLayout(panel)
-        panel_layout.addWidget(self._tabs)
-
         layout = QVBoxLayout()
-        # No margin of its own: the panel is the window, and a gap around it
-        # would put the translucency back as a border.
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(panel)
+        # The host's own page gutter, so the tabs sit off the window edge by the
+        # same amount everything in Settings does.
+        layout.setContentsMargins(*PAGE_MARGINS)
+        layout.addWidget(self._tabs)
         self.setLayout(layout)
 
         self._refresh_timer = QTimer(self)
@@ -632,7 +679,38 @@ class MerchantModeWindow(PluginWindow):
         self._refresh_timer.start(REFRESH_INTERVAL_MS)
 
         self.refresh()
+        # Before restore_visibility, matching the host's own ConsoleWindow: a
+        # window that shows itself and *then* gets dressed shows one unstyled
+        # frame first.
+        self.apply_chrome()
         self.restore_visibility()
+
+    def apply_chrome(self) -> None:
+        """Dress the window in the app's active skin.
+
+        Zero-arg on purpose, and the name is not arbitrary. On every skin
+        change the host walks its ``chrome_surfaces`` — which includes plugin
+        windows — and calls ``apply_chrome()`` / ``apply_skin()`` on anything
+        that has them, each inside its own ``suppress(Exception)`` so an add-on
+        cannot break a skin switch (``app.py:300-308``). It is duck-typed, so
+        defining this method is the entire integration: no import, no
+        registration, and the window re-dresses live while the Appearance page
+        is open.
+
+        Both settings are read defensively. ``PluginWindowContext.settings`` is
+        typed ``Any`` and is a real ``Settings`` only inside the app — under the
+        SDK's ``FakePluginContext`` there may be no ``general`` at all, and
+        raising here would take out the window's constructor rather than its
+        looks.
+        """
+        general = getattr(getattr(self, "window_context", None), "settings", None)
+        general = getattr(general, "general", None)
+        skin = str(getattr(general, "skin", DEFAULT_SKIN) or DEFAULT_SKIN)
+        try:
+            font_size = int(getattr(general, "font_size", DEFAULT_FONT_SIZE))
+        except (TypeError, ValueError):
+            font_size = DEFAULT_FONT_SIZE
+        self.setStyleSheet(window_style(skin, font_size))
 
     # --- construction ------------------------------------------------------
     def _build_server_bar(self) -> QWidget:
@@ -778,7 +856,7 @@ class MerchantModeWindow(PluginWindow):
         self._status = QLabel("", page)
         self._status.setWordWrap(True)
 
-        layout = QVBoxLayout()
+        layout = _page_layout()
         layout.addLayout(scope)
         layout.addLayout(buttons)
         layout.addLayout(row)
@@ -825,10 +903,9 @@ class MerchantModeWindow(PluginWindow):
         for column in (2, 3):
             find_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
 
-        self._find_note = QLabel("", page)
-        self._find_note.setWordWrap(True)
+        self._find_note = _hint(QLabel("", page))
 
-        layout = QVBoxLayout()
+        layout = _page_layout()
         layout.addWidget(self._find_entry)
         layout.addWidget(self._find_table, 1)
         layout.addWidget(self._find_note)
@@ -889,9 +966,9 @@ class MerchantModeWindow(PluginWindow):
             "hour after dumping.",
             page,
         )
-        note.setWordWrap(True)
+        _hint(note)
 
-        layout = QVBoxLayout()
+        layout = _page_layout()
         layout.addWidget(self._dumps_table, 1)
         layout.addLayout(buttons)
         layout.addWidget(self._dumps_summary)
@@ -979,9 +1056,9 @@ class MerchantModeWindow(PluginWindow):
             "junk on every server.",
             page,
         )
-        note.setWordWrap(True)
+        _hint(note)
 
-        layout = QVBoxLayout()
+        layout = _page_layout()
         layout.addLayout(entry)
         layout.addWidget(self._filter_table, 1)
         layout.addLayout(buttons)
@@ -1010,8 +1087,7 @@ class MerchantModeWindow(PluginWindow):
         # window where half the lists are striped looks like two windows.
         self._want_list.setAlternatingRowColors(True)
 
-        self._want_note = QLabel("", page)
-        self._want_note.setWordWrap(True)
+        self._want_note = _hint(QLabel("", page))
 
         note = QLabel(
             "These are items you don't own, so their IDs come from PigParse and "
@@ -1019,9 +1095,9 @@ class MerchantModeWindow(PluginWindow):
             "the right name — it only misbehaves on click.",
             page,
         )
-        note.setWordWrap(True)
+        _hint(note)
 
-        layout = QVBoxLayout()
+        layout = _page_layout()
         layout.addWidget(self._want_entry)
         layout.addWidget(self._want_list, 1)
         layout.addLayout(remove_row)
@@ -1052,7 +1128,11 @@ class MerchantModeWindow(PluginWindow):
         self._results.itemActivated.connect(lambda _item: self._on_search_submitted())
 
         detail = QWidget(page)
+        # The panel's heading, and the only one in the window: it names the item
+        # every figure below it is about, and at body weight a reader scrolling
+        # the feed loses track of which item they are looking at.
         self._detail_title = QLabel("Search for an item.", detail)
+        self._detail_title.setObjectName(TITLE)
         self._detail_title.setWordWrap(True)
 
         # The shape above the numbers, deliberately. Four averages and a live
@@ -1061,8 +1141,7 @@ class MerchantModeWindow(PluginWindow):
         # climbing, and the table alone makes you work that out arithmetically.
         self._detail_chart = PriceChartWidget(detail)
 
-        self._detail_note = QLabel("", detail)
-        self._detail_note.setWordWrap(True)
+        self._detail_note = _hint(QLabel("", detail))
         # A word-wrapped QLabel reports a single line as its minimum height and
         # then draws however many it actually needs, so a two-line provenance
         # string paints straight over the table above it. Reserve the space —
@@ -1134,7 +1213,7 @@ class MerchantModeWindow(PluginWindow):
         self._prices_empty = QLabel(
             "Nothing auctioned yet — this fills in as nParse+ parses /auction traffic.", page
         )
-        self._prices_empty.setWordWrap(True)
+        _hint(self._prices_empty)
 
         feed_box = QGroupBox("Recent /auc traffic", page)
         feed_layout = QVBoxLayout()
@@ -1142,7 +1221,7 @@ class MerchantModeWindow(PluginWindow):
         feed_layout.addWidget(self._prices_table)
         feed_box.setLayout(feed_layout)
 
-        layout = QVBoxLayout()
+        layout = _page_layout()
         layout.addLayout(search_row)
         layout.addWidget(split, 2)
         layout.addWidget(feed_box, 1)
@@ -1236,7 +1315,7 @@ class MerchantModeWindow(PluginWindow):
         now = datetime.now()
         after = self._plugin.stale_after()
         rules = self._plugin.filters()
-        warning = _warning_colour(self)
+        warning = _warning_colour()
         ink = _ink(self)
         self._items_table.setColumnHidden(3, not self._plugin.settings().get("show_ids", False))
 
@@ -1435,7 +1514,7 @@ class MerchantModeWindow(PluginWindow):
 
         matches = self._plugin.find_holdings(query)
         self._find_table.setRowCount(len(matches))
-        warning = _warning_colour(self)
+        warning = _warning_colour()
         for row, match in enumerate(matches):
             self._find_table.setItem(row, 0, _read_only(match.name))
             self._find_table.setItem(row, 1, _read_only(match.where()))
@@ -1611,7 +1690,7 @@ class MerchantModeWindow(PluginWindow):
         records = self._plugin.inventories()
         now = datetime.now()
         after = self._plugin.stale_after()
-        warning = _warning_colour(self)
+        warning = _warning_colour()
 
         selected = self._selected_dump()
         self._dumps_table.setRowCount(len(records))
@@ -2230,8 +2309,20 @@ class MerchantModeWindow(PluginWindow):
 
 
 def build_settings_page(parent: QWidget | None, values: dict) -> QWidget:
+    """The plugin's page inside the host's own Settings window.
+
+    Deliberately unstyled: this page is parented into a host window that is
+    already wearing the active skin, and a second stylesheet applied here would
+    be a second opinion — visible only on the day the two disagree. What it does
+    adopt is the host's gutters, so its rows line up with the pages either side
+    of it, and the host's ``ChromeHint`` name on every explanatory paragraph
+    (see :func:`_hint`), which is what makes them de-emphasise *in the host's
+    sheet* rather than only in this plugin's.
+    """
     page = QWidget(parent)
     form = QFormLayout()
+    form.setContentsMargins(*PAGE_MARGINS)
+    form.setSpacing(ROW_SPACING)
 
     pause = QSpinBox(page)
     pause.setRange(0, MAX_PAUSE_TENTHS)
@@ -2246,7 +2337,7 @@ def build_settings_page(parent: QWidget | None, values: dict) -> QWidget:
         "social carries 3 content lines instead of 5. Set 0 to disable.",
         page,
     )
-    pause_note.setWordWrap(True)
+    _hint(pause_note)
     form.addRow(pause_note)
 
     socials = QSpinBox(page)
@@ -2276,7 +2367,7 @@ def build_settings_page(parent: QWidget | None, values: dict) -> QWidget:
         "you judge.",
         page,
     )
-    stale_note.setWordWrap(True)
+    _hint(stale_note)
     form.addRow(stale_note)
 
     markup = QSpinBox(page)
@@ -2302,7 +2393,7 @@ def build_settings_page(parent: QWidget | None, values: dict) -> QWidget:
         "it is shown.",
         page,
     )
-    pricing_note.setWordWrap(True)
+    _hint(pricing_note)
     form.addRow(pricing_note)
 
     abbreviate = QCheckBox("Abbreviate item names in links", page)
@@ -2322,7 +2413,7 @@ def build_settings_page(parent: QWidget | None, values: dict) -> QWidget:
         "the same item — marks the item's own name with ⚠ either way.",
         page,
     )
-    ids_note.setWordWrap(True)
+    _hint(ids_note)
     form.addRow(ids_note)
 
     prefix = QLineEdit(page)
