@@ -41,6 +41,20 @@ def _host_events_available() -> bool:
     return True
 
 
+def _host_dump_events_available() -> bool:
+    """True when the installed host is new enough to have a dump library.
+
+    Separate from :func:`_host_events_available` because it is a *different*
+    host version being asked about: the Character Dumps events landed in 2.1.0,
+    long after the comms ones.
+    """
+    try:
+        from nparseplus_sdk.events import CharacterDumpImportedEvent  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def _activated() -> tuple[MerchantModePlugin, FakePluginContext]:
     ctx = FakePluginContext(MerchantModePlugin.meta)
     plugin = create_plugin()
@@ -88,13 +102,20 @@ def test_registers_a_settings_page_and_a_tick() -> None:
     assert len(ctx.ticks) == 1
 
 
-def test_subscribes_to_comms_and_character_changes_when_the_host_is_available() -> None:
+def test_subscribes_to_comms_character_changes_and_dumps_when_the_host_is_there() -> None:
     _, ctx = _activated()
     if not _host_events_available():
         assert ctx.subscriptions == []
         return
     subscribed = {event_type.__name__ for event_type, _fn in ctx.subscriptions}
-    assert subscribed == {"CommsEvent", "AfterPlayerChangedEvent"}
+    expected = {"CommsEvent", "AfterPlayerChangedEvent"}
+    # The dump events arrived in 2.1.0, which is what min_app_version now
+    # claims — so a host without them is one the app would refuse to load this
+    # plugin into. A dev checkout can still be sitting on one, and there the
+    # guarded import must cost only the subscription it names.
+    if _host_dump_events_available():
+        expected |= {"CharacterDumpImportedEvent", "CharacterDumpUpdatedEvent"}
+    assert subscribed == expected
 
 
 def test_registers_no_line_parsers() -> None:
@@ -212,6 +233,192 @@ def test_listings_remember_which_character_holds_the_item() -> None:
     restored = create_plugin()
     restored.activate(FakePluginContext(MerchantModePlugin.meta, storage=ctx.storage))
     assert restored.snapshot()["listings"][0].character == "Xantik"
+
+
+# --- dumps the host hands over ---------------------------------------------
+#
+# nParse+ 2.1.0 watches the EQ directory and files every /outputfile dump away
+# as a JSON snapshot, announcing it on the bus. The events are host-only, so
+# these drive the ingest directly with a snapshot written the way the library
+# writes one — which is the part of the contract the plugin actually depends on.
+
+SNAPSHOT_ROWS = [
+    {
+        "location": 0,
+        "location_name": "Charm",
+        "name": "Guise of the Deceiver",
+        "item_id": 1234,
+        "count": 1,
+        "slots": 0,
+    },
+    {
+        "location": 22,
+        "location_name": "General1-Slot1",
+        "name": "Manastone",
+        "item_id": 4567,
+        "count": 1,
+        "slots": 0,
+    },
+]
+
+
+def _snapshot(
+    tmp_path,
+    character: str = "Xantik",
+    *,
+    kind: str = "inventory",
+    rows: list[dict] | None = None,
+    digest: str = "abc123",
+    schema_version: int = 1,
+):
+    """One stored snapshot, shaped like ``CharacterDump.model_dump_json``.
+
+    Note ``server``: P99 writes ``<Character>-Inventory.txt`` and the host only
+    reads a server out of a ``Name_Server-Kind.txt`` spelling, so this field is
+    empty on real snapshots and on the events that announce them.
+    """
+    import json
+
+    path = tmp_path / f"{digest}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "character": character,
+                "server": "",
+                "kind": kind,
+                "captured_at": T0.isoformat(),
+                "imported_at": T0.isoformat(),
+                "source_file": f"/eq/{character}-Inventory.txt",
+                "digest": digest,
+                "items": SNAPSHOT_ROWS if rows is None else rows,
+                "spells": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _ingest(plugin, path, **overrides) -> int:
+    """Call the ingest the way ``_watch_dumps`` calls it off an event."""
+    fields = {
+        "character": "Xantik",
+        "server": "",
+        "kind": "inventory",
+        "captured_at": T0,
+        "digest": "abc123",
+        "source_file": "/eq/Xantik-Inventory.txt",
+    }
+    fields.update(overrides)
+    return plugin.ingest_dump_snapshot(path, **fields)
+
+
+def test_a_dump_the_host_noticed_arrives_without_anyone_opening_a_dialog(tmp_path) -> None:
+    plugin, _ = _activated()
+    before = plugin.snapshot()["version"]
+
+    assert _ingest(plugin, _snapshot(tmp_path)) == 2
+    assert {holding.name for holding in plugin.holdings()} == {
+        "Guise of the Deceiver",
+        "Manastone",
+    }
+    # Bag slots survive the round trip through the host's own field names.
+    assert plugin.locate("Manastone")[0].item.location == "General1-Slot1"
+    assert plugin.resolve_id("Manastone").item_id == 4567
+    # The window redraws off this counter and would otherwise never notice.
+    assert plugin.snapshot()["version"] > before
+
+
+def test_a_spellbook_snapshot_is_left_alone(tmp_path) -> None:
+    # The other kind of dump. There is nothing in a spellbook to sell.
+    plugin, _ = _activated()
+    path = _snapshot(tmp_path, kind="spellbook", rows=[])
+    assert _ingest(plugin, path, kind="spellbook") == 0
+    assert plugin.inventories() == []
+
+
+def test_the_same_dump_arriving_again_changes_nothing(tmp_path) -> None:
+    """Re-running /outputfile out of habit must not redraw the window forever.
+
+    The digest is over the dump's contents, so an unchanged dump collides with
+    the one already filed.
+    """
+    plugin, _ = _activated()
+    path = _snapshot(tmp_path)
+    assert _ingest(plugin, path) == 2
+    settled = plugin.snapshot()["version"]
+
+    assert _ingest(plugin, path) == 0
+    assert plugin.snapshot()["version"] == settled
+    assert len(plugin.inventories()) == 1
+
+
+def test_a_changed_dump_replaces_the_one_it_supersedes(tmp_path) -> None:
+    plugin, _ = _activated()
+    _ingest(plugin, _snapshot(tmp_path))
+    later = _snapshot(tmp_path, rows=SNAPSHOT_ROWS[:1], digest="def456")
+
+    assert _ingest(plugin, later, digest="def456") == 1
+    assert len(plugin.inventories()) == 1
+    assert [holding.name for holding in plugin.holdings()] == ["Guise of the Deceiver"]
+
+
+def test_a_dump_with_no_server_on_it_is_filed_under_the_one_in_play(tmp_path) -> None:
+    # The trap: the event's server is empty in practice, and taking it at its
+    # word would drop every automatic dump into the unfiled bucket, where
+    # nothing on the Sell tab can be priced or advertised.
+    plugin, _ = _activated()
+    plugin.set_server("green")
+
+    assert _ingest(plugin, _snapshot(tmp_path)) == 2
+    assert [record.server for record in plugin.inventories()] == ["green"]
+    assert len(plugin.holdings(server="green")) == 2
+    assert plugin.holdings(server="") == []
+
+
+def test_a_dump_that_arrived_on_its_own_says_so(tmp_path) -> None:
+    from merchant_mode.inventory import ORIGIN_HOST, ORIGIN_MANUAL
+
+    plugin, _ = _activated()
+    _ingest(plugin, _snapshot(tmp_path, "Xantik"))
+    plugin.load_dump(_dump(tmp_path, "Mulebank", MULE_DUMP))
+
+    origins = {record.character: record.origin for record in plugin.inventories()}
+    assert origins == {"Xantik": ORIGIN_HOST, "Mulebank": ORIGIN_MANUAL}
+
+
+def test_the_remembered_path_is_the_game_file_not_the_host_snapshot(tmp_path) -> None:
+    # Reload re-reads a tab-separated dump, and the game file is also the one
+    # the next /outputfile rewrites. The snapshot is the host's own copy.
+    plugin, _ = _activated()
+    _ingest(plugin, _snapshot(tmp_path))
+    assert plugin.inventories()[0].source_path == "/eq/Xantik-Inventory.txt"
+
+
+def test_a_snapshot_from_a_newer_nparseplus_is_not_half_read(tmp_path) -> None:
+    # Same fields could mean other things. A missing row beats a wrong one.
+    plugin, _ = _activated()
+    assert _ingest(plugin, _snapshot(tmp_path, schema_version=99)) == 0
+    assert plugin.inventories() == []
+
+
+def test_a_snapshot_that_is_no_longer_there_is_not_fatal(tmp_path) -> None:
+    plugin, _ = _activated()
+    assert _ingest(plugin, tmp_path / "gone.json") == 0
+    assert plugin.inventories() == []
+
+
+def test_an_automatic_dump_survives_a_restart_still_saying_where_it_came_from(tmp_path) -> None:
+    from merchant_mode.inventory import ORIGIN_HOST
+
+    plugin, ctx = _activated()
+    _ingest(plugin, _snapshot(tmp_path))
+    plugin.deactivate()
+
+    restored = create_plugin()
+    restored.activate(FakePluginContext(MerchantModePlugin.meta, storage=ctx.storage))
+    assert restored.inventories()[0].origin == ORIGIN_HOST
 
 
 # --- price push ------------------------------------------------------------

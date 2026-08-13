@@ -1,9 +1,10 @@
 """Merchant Mode — inventory into linkable WTS auction macros, for nParse+.
 
-Load an ``/outputfile inventory`` dump, pick what you're selling, set prices,
-and export a macro pack the host's Macro Editor imports. The item ids come out
-of the dump itself, so the links are forged from the game's own answer rather
-than from a lookup table that might be stale.
+Load an ``/outputfile inventory`` dump — or let nParse+ hand over the one it
+noticed you writing — pick what you're selling, set prices, and export a macro
+pack the host's Macro Editor imports. The item ids come out of the dump itself,
+so the links are forged from the game's own answer rather than from a lookup
+table that might be stale.
 
 **The plugin never sends anything.** It builds macros; the human presses the
 button. There is no keystroke simulation anywhere in this package — P99 bans
@@ -51,13 +52,18 @@ from .chartdata import PriceChart, build_chart
 from .filters import FilterRule, ItemFilters
 from .finding import HoldingMatch, find_holdings
 from .inventory import (
+    ORIGIN_HOST,
+    ORIGIN_MANUAL,
+    SNAPSHOT_INVENTORY,
     STALE_AFTER,
     CharacterInventory,
     Holding,
     InventoryItem,
     InventoryVault,
     character_from_filename,
+    inventory_key,
     parse_inventory_file,
+    parse_snapshot_file,
     sellable,
 )
 from .itemnames import ItemNameIndex
@@ -149,6 +155,42 @@ def _watch_character(ctx: PluginContext, plugin: MerchantModePlugin) -> None:
     ctx.subscribe(AfterPlayerChangedEvent, on_after)
 
 
+def _watch_dumps(ctx: PluginContext, plugin: MerchantModePlugin) -> None:
+    """Take inventory dumps in as the host files them, with nobody asking.
+
+    nParse+ 2.1.0 watches the EQ directory and stores a snapshot of every
+    ``/outputfile`` dump it sees, announcing each one on the bus. A merchant
+    who dumps six mules in a row should not then have to find six files in a
+    dialog, so the plugin listens and reads them.
+
+    The events carry *identity* — character, kind, digest, and the path of the
+    snapshot — rather than items, because the library itself is host-internal;
+    :meth:`MerchantModePlugin.ingest_dump_snapshot` does the reading. Both
+    events are the same news to a merchant (a dump exists and this is what it
+    says), so both go to one handler; the diff on the Updated one is about
+    what *changed*, which is a question the Dumps tab answers with ages.
+
+    These classes arrived in 2.1.0, which is why ``min_app_version`` names it:
+    below that this import raises and the caller's ``except ImportError`` puts
+    the whole subscription block — auctions included — out of action.
+    """
+    from nparseplus_sdk.events import CharacterDumpImportedEvent, CharacterDumpUpdatedEvent
+
+    def on_dump(event: Any) -> None:
+        plugin.ingest_dump_snapshot(
+            event.path,
+            character=event.character,
+            server=event.server,
+            kind=event.kind,
+            captured_at=event.captured_at,
+            digest=event.digest,
+            source_file=event.source_file,
+        )
+
+    ctx.subscribe(CharacterDumpImportedEvent, on_dump)
+    ctx.subscribe(CharacterDumpUpdatedEvent, on_dump)
+
+
 class MerchantModePlugin(NParsePlugin):
     meta = PluginMeta(
         id="merchant-mode",
@@ -163,12 +205,14 @@ class MerchantModePlugin(NParsePlugin):
         author="prokopto-dev",
         homepage="https://github.com/prokopto-dev/nparseplus-merchantmode",
         requires_sdk=">=1.0,<2",
-        # The version this was actually built and verified against. The plugin
-        # reads ``ctx.player.server_key`` and subscribes to
-        # ``AfterPlayerChangedEvent``; rather than guess how far back those go,
-        # claim only what has been tested and let the host block older installs
-        # instead of letting them fail at runtime.
-        min_app_version="1.18.0",
+        # The version this was actually built and verified against, and now
+        # also a hard floor: the Character Dumps library and its
+        # ``CharacterDumpImportedEvent`` / ``CharacterDumpUpdatedEvent`` landed
+        # in 2.1.0, and on anything older the subscription block raises
+        # ImportError and takes auction tracking down with it. Claim only what
+        # has been tested and let the host block older installs rather than
+        # letting them half-work at runtime.
+        min_app_version="2.1.0",
     )
 
     def __init__(self) -> None:
@@ -177,6 +221,11 @@ class MerchantModePlugin(NParsePlugin):
         self._lock = threading.Lock()
         self._version = 0
         self._vault = InventoryVault()
+        # Content digests of the dumps the host has already handed over, per
+        # character and server, so an unchanged one arriving again costs
+        # nothing. Deliberately not persisted: it is an optimisation, and after
+        # a restart the first event simply re-files rows the vault already has.
+        self._ingested: dict[str, str] = {}
         # Everything a trade touches is filed by server key ("" is the real,
         # reachable bucket for a dump loaded before any server was chosen).
         # There is no combined view: items don't cross servers, so a pooled
@@ -254,8 +303,12 @@ class MerchantModePlugin(NParsePlugin):
         try:
             _watch_auctions(ctx, self)
             _watch_character(ctx, self)
+            _watch_dumps(ctx, self)
         except ImportError:
-            ctx.logger.warning("host events unavailable (standalone run); price tracking is inert")
+            ctx.logger.warning(
+                "host events unavailable (standalone run); price tracking and "
+                "automatic dump ingest are inert"
+            )
 
     def deactivate(self) -> None:
         self._persist()
@@ -292,6 +345,86 @@ class MerchantModePlugin(NParsePlugin):
         self._store_dump(who, where, items, captured_at=stamp, source_path=str(path))
         return len(items)
 
+    def ingest_dump_snapshot(
+        self,
+        path: Path | str,
+        *,
+        character: str = "",
+        server: str = "",
+        kind: str = SNAPSHOT_INVENTORY,
+        captured_at: datetime | None = None,
+        digest: str = "",
+        source_file: str = "",
+    ) -> int:
+        """Take in a dump the host's library just stored. Returns the item count.
+
+        The other end of :func:`_watch_dumps`: everything here comes off a
+        ``CharacterDumpImportedEvent`` or ``CharacterDumpUpdatedEvent``, which
+        name a snapshot rather than carrying one. Zero means nothing was taken
+        — a spellbook, an unchanged dump arriving again, or a snapshot with
+        nothing sellable in it — and is not an error.
+
+        Runs on the driver thread, like the auction subscription. All the state
+        it touches goes through :meth:`_store_dump`'s lock.
+        """
+        # A spellbook is the other kind of dump and holds nothing to sell. An
+        # event with no kind at all is a shape the host does not send; let it
+        # through to the items check rather than inventing a rule for it.
+        if kind.strip().casefold() not in ("", SNAPSHOT_INVENTORY):
+            return 0
+
+        # Same fallback chain as load_dump, and for the same reason — except
+        # that here the event names the character, so the other two are only
+        # ever reached if the host sent a blank one.
+        who = (
+            character.strip()
+            or self._active_character()
+            or character_from_filename(source_file or path)
+        )
+        # SERVER IS THE TRAP. P99 writes ``<Character>-Inventory.txt`` and the
+        # host only reads a server out of a ``Name_Server-Kind.txt`` spelling,
+        # so ``event.server`` is empty in practice — every auto-ingested dump
+        # would land in the unfiled bucket if this took it at its word.
+        where = normalize_key(server) or self._active_server() or self._server
+
+        # The digest is over the dump's *contents*, so re-running /outputfile
+        # out of habit produces the one already filed. Skipping it keeps the
+        # version counter still — the window would otherwise redraw on every
+        # scan — and leaves any rows the seller cropped off this dump cropped.
+        seen = inventory_key(who, where)
+        if digest:
+            with self._lock:
+                if self._ingested.get(seen) == digest:
+                    return 0
+
+        items = sellable(parse_snapshot_file(path))
+        if not items:
+            return 0
+        self._store_dump(
+            who,
+            where,
+            items,
+            captured_at=captured_at or _dump_mtime(source_file or path),
+            # The game's own file, not the snapshot: Reload on the Dumps tab
+            # re-reads a tab-separated dump, and that file is also the one the
+            # next /outputfile rewrites. The snapshot is the host's copy of it.
+            source_path=str(source_file or path),
+            origin=ORIGIN_HOST,
+        )
+        if digest:
+            with self._lock:
+                self._ingested[seen] = digest
+        if self._ctx is not None:
+            # Worth a line: a merchant juggling mules should be able to see the
+            # dump they just typed arrive, rather than wonder whether it did.
+            self._ctx.logger.info(
+                "took in %s's inventory dump from the host — %d sellable item(s) on %s",
+                who or "an unnamed character",
+                len(items),
+                label_for(where) or "no server",
+            )
+        return len(items)
+
     def _store_dump(
         self,
         character: str,
@@ -300,11 +433,22 @@ class MerchantModePlugin(NParsePlugin):
         *,
         captured_at: datetime,
         source_path: str,
+        origin: str = ORIGIN_MANUAL,
     ) -> None:
-        """File one character's items under one server, and remember the file."""
+        """File one character's items under one server, and remember the file.
+
+        ``origin`` is how this copy of the dump got here. The Dumps tab says it
+        on every row: one that appeared without being asked for is one the
+        reader never chose, and an unexplained row is one they can't weigh.
+        """
         with self._lock:
             self._vault.put(
-                character, server, items, captured_at=captured_at, source_path=source_path
+                character,
+                server,
+                items,
+                captured_at=captured_at,
+                source_path=source_path,
+                origin=origin,
             )
             for item in items:
                 self._catalog.learn_owned(item.name, item.item_id)
@@ -341,6 +485,10 @@ class MerchantModePlugin(NParsePlugin):
             items,
             captured_at=_dump_mtime(record.source_path),
             source_path=record.source_path,
+            # Whatever brought the first copy in, *these* rows were asked for:
+            # the Source column answers "where did this dump come from", not
+            # "who introduced this character".
+            origin=ORIGIN_MANUAL,
         )
         return len(items)
 

@@ -55,6 +55,19 @@ Nothing that prices, lists or advertises an item may call it.
   imported inside the function that needs it, guarded, never at module scope;
   and nothing comes from PyPI, since a frozen build has no pip. That test also
   loads the package through `load_plugin_factory`, the way the app does.
+- **The host's dump library is not plugin API.** `PluginContext` exposes no
+  dumps, so auto-ingest subscribes to `CharacterDumpImportedEvent` /
+  `CharacterDumpUpdatedEvent` (the `nparseplus_sdk.events` re-export, host-only,
+  guarded) and reads the snapshot they *name* with plain `json.load` —
+  `inventory.parse_snapshot_file`, mapped onto the same `InventoryItem` rows the
+  TSV parser produces. Two traps: the event's `server` is effectively always
+  `""`, because P99 writes `<Character>-Inventory.txt` and the host only reads a
+  server out of a `Name_Server-Kind.txt` spelling, so it is resolved exactly the
+  way `load_dump()` resolves it; and the snapshot carries a `schema_version`
+  that `SNAPSHOT_SCHEMA_VERSION` pins against, because a bag slot read out of a
+  shape that changed is worse than no row at all. Field names are asserted
+  against the host's own writer in `tests/test_host_events.py`, which skips
+  wherever the app isn't installed — including CI.
 - Decisions live below the Qt line. `chartdata.py` decides what a chart should
   say; `PriceChartWidget` only puts it on screen. `finding.py` ranks; the table
   only lists. If a rule can be unit-tested without a display, it belongs there.
@@ -96,9 +109,9 @@ uv venv && uv pip install -e ".[dev]"
 .venv/bin/nparseplus-plugin validate merchant_mode
 ```
 
-CI installs the **SDK only** — no PySide6, no host app — so `tests/test_window.py`
-and `tests/test_capture_screenshots.py` skip there. Run them locally with the app
-installed and `QT_QPA_PLATFORM=offscreen`.
+CI installs the **SDK only** — no PySide6, no host app — so `tests/test_window.py`,
+`tests/test_capture_screenshots.py` and `tests/test_host_events.py` skip there.
+Run them locally with the app installed and `QT_QPA_PLATFORM=offscreen`.
 
 Ruff config lives in `pyproject.toml` (line length 100). Run `ruff check` on the
 files you touched; the tree is not `ruff format`-clean, so don't reformat the
