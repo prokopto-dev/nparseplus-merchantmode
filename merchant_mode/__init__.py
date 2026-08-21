@@ -208,12 +208,14 @@ class MerchantModePlugin(NParsePlugin):
     meta = PluginMeta(
         id="merchant-mode",
         name="Merchant Mode",
-        # One release for three changes that all answer the same thing — the
-        # host moved on: it wears skins now, it files inventory dumps itself,
-        # and a seller wanted the asking price to be their number rather than
-        # the market's. Minor rather than patch: the window looks different, two
-        # settings are new, and dumps arrive without being asked for.
-        version="0.5.0",
+        # Patch, and the code is untouched: 0.5.1 exists so the move onto the
+        # nParse+ plugin registry has a version to publish. A registry version
+        # is spent once and never reused, so a pipeline that now publishes
+        # itself gets its own number rather than re-cutting 0.5.0 with
+        # different bytes behind the same one. 0.5.0 was the release where the
+        # host moved on — skins, dumps filed by the app itself, and an asking
+        # price that is your number rather than the market's.
+        version="0.5.1",
         description=(
             "Turn your inventory into linkable WTS auction macros, find which "
             "mule is holding what, look up what anything is worth, and see how "
