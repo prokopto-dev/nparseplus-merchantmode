@@ -1,7 +1,15 @@
 name: Release
 
-# Tag vX.Y.Z (matching PluginMeta.version) to publish a GitHub release with
-# the installable zip, its sha256, and a ready-made registry entry JSON.
+# Tag vX.Y.Z (matching PluginMeta.version) to build the installable zip, publish
+# it as a GitHub release, and list that version in the nParse+ plugin registry.
+#
+# Two jobs, and the split is the point. `build` produces the artifact and the two
+# facts about it the registry needs — the version and the sha256 — and publishes
+# the GitHub release. `publish` calls the registry's own reusable workflow with
+# those facts. Nothing here composes an index entry any more: the pull request
+# against prokopto-dev/nparseplus-plugins that used to be the last step is
+# superseded, and the registry hashes the bytes itself rather than trusting a
+# digest that was pasted into a PR body.
 
 on:
   push:
@@ -15,8 +23,19 @@ env:
   PLUGIN_DIR: merchant_mode
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
+    outputs:
+      # The two things the publish job cannot work out for itself. `version` is
+      # the tag with its v stripped, done HERE, in the repository where you can
+      # watch it happen — the registry deliberately does not guess which of
+      # `v1.2.0` and `1.2.0` you meant. `sha256` is taken off the RELEASE ASSET
+      # rather than off the local zip, and the step that takes it asserts the
+      # two agree: on any normal run it is this build's own claim about its own
+      # bytes, and on a recovery run it still describes the file the registry
+      # will actually download.
+      version: ${{ steps.meta.outputs.version }}
+      sha256: ${{ steps.published.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,6 +50,7 @@ jobs:
         run: nparseplus-plugin validate "$PLUGIN_DIR"
 
       - name: Check tag matches PluginMeta.version
+        id: meta
         run: |
           python - <<'EOF'
           import os, sys
@@ -44,63 +64,163 @@ jobs:
                   f"{plugin.meta.version} — bump meta.version and re-tag"
               )
           print(f"ok: {plugin.meta.id} v{tag}")
+          # Past the gate the two are the same string, so which one is emitted
+          # is a matter of what it means: this is the version the plugin
+          # DECLARES, which is what the registry is being told.
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={plugin.meta.version}\n")
           EOF
 
       - name: Build zip (single-root layout the nParse+ installer requires)
+        id: zip
         run: |
+          set -euo pipefail
           zip -r "${PLUGIN_DIR}.zip" "$PLUGIN_DIR" \
             -x "*/__pycache__/*" -x "*.pyc"
           sha256sum "${PLUGIN_DIR}.zip" | tee sha256.txt
-
-      - name: Compose release body (includes the registry entry JSON)
-        run: |
-          python - <<'EOF'
-          import hashlib, json, os
-          from nparseplus_sdk.loading import load_plugin_factory
-
-          plugin_dir = os.environ["PLUGIN_DIR"]
-          meta = load_plugin_factory(plugin_dir)().meta
-          repo = os.environ["GITHUB_REPOSITORY"]
-          tag = os.environ["GITHUB_REF_NAME"]
-          url = (
-              f"https://github.com/{repo}/releases/download/{tag}/{plugin_dir}.zip"
-          )
-          digest = hashlib.sha256(open(f"{plugin_dir}.zip", "rb").read()).hexdigest()
-          entry = {
-              "id": meta.id,
-              "name": meta.name,
-              "description": meta.description,
-              "author": meta.author,
-              "homepage": meta.homepage or f"https://github.com/{repo}",
-              "latest": {
-                  "version": meta.version,
-                  "url": url,
-                  "sha256": digest,
-                  "requires_sdk": meta.requires_sdk,
-                  **(
-                      {"min_app_version": meta.min_app_version}
-                      if meta.min_app_version
-                      else {}
-                  ),
-              },
-          }
-          body = (
-              f"## {meta.name} v{meta.version}\n\n"
-              f"Install: nParse+ → Settings → Plugins → *Install from URL* with the "
-              f"zip asset below, or wait for the registry listing.\n\n"
-              f"`sha256: {digest}`\n\n"
-              "### Registry entry (for the nparseplus-plugins index PR)\n\n"
-              "```json\n" + json.dumps(entry, indent=2) + "\n```\n"
-          )
-          open("release-body.md", "w").write(body)
-          open("registry-entry.json", "w").write(json.dumps(entry, indent=2))
-          EOF
+          # What THIS job built, which is not automatically what ends up
+          # published — see the two steps below. The number sent to the
+          # registry is the one taken off the release asset.
+          echo "sha256=$(sha256sum "${PLUGIN_DIR}.zip" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub release
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHA256: ${{ steps.zip.outputs.sha256 }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --notes-file release-body.md \
-            "${PLUGIN_DIR}.zip" registry-entry.json
+          set -euo pipefail
+          {
+            printf '## Merchant Mode v%s\n\n' "$VERSION"
+            printf 'Install through nParse+ → Settings → Plugins → *Browse\n'
+            printf 'registry…*, which lists this release once the registry has it,\n'
+            printf 'or with *Install from URL* pointed at the zip asset below.\n\n'
+            printf 'sha256 of %s.zip:\n\n    %s\n' "$PLUGIN_DIR" "$SHA256"
+          } > release-body.md
+
+          # CREATE OR COMPLETE, never just create. Everything after this step
+          # can fail — a flaky anonymous fetch, a cancelled run, a registry
+          # outage — and a re-run starts this job at step one, where a plain
+          # `gh release create` fails on a tag that already has a release. The
+          # job would then go red on the recovery attempt, `publish` would stay
+          # skipped, and the only way out would be deleting a published release
+          # by hand. Each branch below is one state a previous attempt can have
+          # left behind.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "a release for $TAG already exists — this is a re-run"
+
+            # A draft's assets do not exist for an anonymous caller, so a draft
+            # is precisely the state this pipeline is built to never be in.
+            # We never create one; an interrupted `gh release create` or a hand
+            # -made release can. On a release that is already live this is a
+            # no-op.
+            gh release edit "$TAG" --draft=false >/dev/null
+
+            if gh release view "$TAG" --json assets --jq '.assets[].name' \
+                 | grep -Fxq "${PLUGIN_DIR}.zip"; then
+              # DELIBERATELY NOT CLOBBERED. `zip` records mtimes, so rebuilding
+              # the same commit does not produce the same bytes — and if the
+              # publish job already reached the registry, those earlier bytes
+              # are the ones it hashed and recorded. Replacing them turns a
+              # release waiting for review into one whose artifact no longer
+              # matches what is on file, which no re-run can undo.
+              echo "…and it already carries ${PLUGIN_DIR}.zip; leaving those bytes alone"
+              echo "asset=reused" >> "$GITHUB_OUTPUT"
+            else
+              # The release exists but the upload never landed.
+              gh release upload "$TAG" "${PLUGIN_DIR}.zip"
+              echo "asset=built" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # NOT a draft, and that is load-bearing rather than a default. The
+            # registry fetches the asset as an ANONYMOUS caller, and a draft
+            # release's asset does not exist for one; publishing it here,
+            # before the publish job runs, is the whole ordering constraint.
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes-file release-body.md \
+              "${PLUGIN_DIR}.zip"
+            echo "asset=built" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Hash the asset an anonymous caller gets
+        id: published
+        env:
+          ARTIFACT_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ env.PLUGIN_DIR }}.zip
+          BUILT_SHA256: ${{ steps.zip.outputs.sha256 }}
+          ASSET: ${{ steps.release.outputs.asset }}
+        run: |
+          set -euo pipefail
+          # No credential, deliberately: this is the fetch the registry will
+          # make. Failing here, where the message is about a release asset,
+          # beats succeeding into a publish that lands with verified: false —
+          # a release recorded, its version spent, and its bytes never checked.
+          curl --silent --show-error --fail --location --proto '=https' \
+               --retry 5 --retry-all-errors --retry-delay 3 --max-time 120 \
+               --output published.zip "$ARTIFACT_URL"
+          published=$(sha256sum published.zip | cut -d' ' -f1)
+
+          if [ "$published" = "$BUILT_SHA256" ]; then
+            echo "ok: the asset downloads unauthenticated and is byte-identical to the zip this job built"
+          elif [ "$ASSET" = "reused" ]; then
+            # A recovery run over an asset an earlier attempt uploaded. The
+            # rebuild differs from it because `zip` stores mtimes, not because
+            # the source moved — and the published bytes are the ones the
+            # registry will read, so they are the ones it gets told about.
+            echo "::warning::the published asset is $published, not the $BUILT_SHA256 this run rebuilt. That is expected on a re-run that kept an earlier attempt's upload — zip records mtimes — and the published bytes are what the registry is sent."
+          else
+            # This run uploaded the zip and the download is something else.
+            # Nothing benign explains that, so it stops here rather than
+            # claiming a digest for bytes nobody can account for.
+            echo "::error::this run uploaded $BUILT_SHA256 but the release asset downloads as $published. Nothing was published to the registry."
+            exit 1
+          fi
+          echo "sha256=$published" >> "$GITHUB_OUTPUT"
+
+  publish:
+    # The GitHub release is created in the last steps of `build`, so `needs`
+    # is what guarantees the artifact-url below resolves before anybody fetches
+    # it. Do not run these two in parallel and do not move the release creation
+    # into this job.
+    needs: build
+    # PINNED TO A 40-CHARACTER SHA (nparse-plugin-regserve v0.2.0), never to a
+    # branch. A reusable workflow runs as our job with our secret, so `@main`
+    # would hand tomorrow's version of somebody else's branch a token that can
+    # publish releases of this plugin.
+    uses: prokopto-dev/nparse-plugin-regserve/.github/workflows/publish-plugin.yml@0603b68f284eb39a687e75845d70d5a4e5d2f0be
+    with:
+      plugin-id: merchant-mode
+      version: ${{ needs.build.outputs.version }}
+      # The zip's name is spelled out rather than taken from env.PLUGIN_DIR:
+      # a reusable workflow's `with:` cannot read the env context. Rename the
+      # package directory and this line changes with it.
+      artifact-url: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/merchant_mode.zip
+      artifact-sha256: ${{ needs.build.outputs.sha256 }}
+      # Both mirror PluginMeta, which is the only place they are decided.
+      sdk-specifier: '>=1.0,<2'
+      minimum-app-version: '2.1.0'
+      # PLAIN TEXT, at most 2048 bytes, and not Markdown: this is rendered in a
+      # text widget inside the app on somebody else's machine, so asterisks
+      # arrive as asterisks. The GitHub release body above is the Markdown one;
+      # these notes are deliberately not read from it.
+      notes: |
+        Merchant Mode 0.5.1
+
+        Nothing in the plugin itself changed. This release carries a move: from
+        here on Merchant Mode is published to the nParse+ plugin registry by its
+        own release pipeline, on tag, rather than by a hand-edited pull request
+        against the old plugin index.
+
+        What that buys you is a shorter path between a fix and your copy of it,
+        and one honest number: the sha256 listed against this release is one the
+        registry computed from the bytes it downloaded, not one anybody typed.
+
+        If you are running 0.5.0 there is nothing here to hurry for. The window,
+        the macro packing, the 255-byte line budget, the price history and every
+        setting behave exactly as they did.
+    secrets:
+      # Minted at https://nparseplugins.prokopto.dev/account with the
+      # plugin:publish scope, pinned to merchant-mode, and shown exactly once.
+      registry-token: ${{ secrets.REGSERVE_TOKEN }}

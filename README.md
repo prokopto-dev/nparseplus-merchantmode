@@ -450,6 +450,27 @@ rather than being dropped. Set the pause to `0` in settings to get all five back
 
 ---
 
+## Installing
+
+Merchant Mode is published to the [nParse+ plugin
+registry](https://nparseplugins.prokopto.dev/), so the shortest way in is the
+app's own: **Settings → Plugins → *Browse registry…***, find Merchant Mode,
+install. Later versions turn up in the same table, and the installer checks the
+zip against the sha256 the listing pins before it unpacks a byte of it.
+
+Every release is also a [GitHub
+release](https://github.com/prokopto-dev/nparseplus-merchantmode/releases) with
+the same `merchant_mode.zip` attached, for a machine that can't reach the
+registry or a version the registry hasn't listed yet. **Settings → Plugins →
+*Install from URL*** takes it, and the release body prints the sha256 the build
+produced so what you downloaded can be checked against what was built. The
+registry hashes those same bytes itself rather than repeating a number somebody
+typed, which is why the two agreeing means something.
+
+Either route wants nParse+ **2.1.0** or newer — that is where the Character
+Dumps library this reads landed, and the app refuses an older install rather
+than letting it half-work.
+
 ## Using it
 
 1. In game: `/outputfile inventory` — this writes `<Character>-Inventory.txt`

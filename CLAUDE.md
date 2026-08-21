@@ -143,6 +143,59 @@ Ruff config lives in `pyproject.toml` (line length 100). Run `ruff check` on the
 files you touched; the tree is not `ruff format`-clean, so don't reformat the
 whole repo in a change about something else.
 
+### Releasing
+
+`.github/workflows/release.yml` fires on a `vX.Y.Z` tag and is two jobs on
+purpose. `build` validates, refuses a tag that disagrees with
+`PluginMeta.version`, zips the single-root layout, publishes the GitHub release,
+and exposes `version` and `sha256` as job outputs. `publish` hands those to the
+registry's own `workflow_call` workflow in
+[`prokopto-dev/nparse-plugin-regserve`](https://github.com/prokopto-dev/nparse-plugin-regserve).
+There is no index entry to compose any more and no PR to open: the old
+`nparseplus-plugins` flow is superseded, and the registry rehashes the artifact
+itself rather than believing a digest that was pasted into a pull request.
+
+Five things in that file are load-bearing, and each is a way it could go quietly
+wrong:
+
+- **The `uses:` is pinned to a 40-character SHA**, never a branch and never a
+  tag. A reusable workflow runs as *our* job with *our* secret, so `@main` hands
+  whatever that branch says tomorrow a token that can publish this plugin.
+  Moving the pin is a deliberate read of the diff.
+- **The release must be fully published — never a draft — before `publish`
+  runs.** The registry fetches `artifact-url` as an *anonymous* caller and a
+  draft's asset does not exist for one. `needs: build`, the release created in
+  `build`'s last steps, and the unauthenticated `curl` after it are that
+  ordering said three times, because getting it wrong produces a release that is
+  recorded, has spent its version, and whose bytes were never checked.
+- **`notes:` is plain text, capped at 2048 bytes**, and is deliberately not read
+  from the GitHub release body. It renders in a text widget in the app, so
+  asterisks arrive as asterisks; a release body is Markdown and is editable
+  after the fact, which would make the published notes quietly stop matching it.
+- **Everything after the release is created has to be re-runnable, and the
+  release step is written that way.** A re-run starts the job at step one, so it
+  creates the release *or completes* one a previous attempt left behind —
+  publishing it if it is a draft, uploading the zip if that upload never landed
+  — where a plain `gh release create` would fail on a tag that already has a
+  release and leave `publish` skipped with no way out but deleting a published
+  release by hand. It never clobbers an asset an earlier attempt uploaded:
+  `zip` records mtimes, so a rebuild of the same commit is not the same bytes,
+  and if the registry already recorded this version those earlier bytes are the
+  ones it hashed. That is also why the sha256 sent to the registry is taken off
+  the release asset rather than off the local zip — and why the step that takes
+  it hard-fails when *this* run's upload and the download disagree, which
+  nothing benign explains.
+- **`state: pending` is a success.** A plugin id's first release always goes to
+  human review whatever the trust level, and the job passes with a warning
+  annotation. Don't add a gate that fails the pipeline on it — that would be
+  failing on the correct outcome.
+
+The secret is `REGSERVE_TOKEN`: a `plugin:publish` token pinned to
+`merchant-mode`, minted at <https://nparseplugins.prokopto.dev/account> and
+shown exactly once. `PluginMeta.version` is the only place a version is decided;
+`sdk-specifier` and `minimum-app-version` in the workflow mirror
+`requires_sdk` and `min_app_version` and have to be changed with them.
+
 ### Screenshots
 
 The README's images are real offscreen renders, not mockups:
