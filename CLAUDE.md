@@ -155,7 +155,7 @@ There is no index entry to compose any more and no PR to open: the old
 `nparseplus-plugins` flow is superseded, and the registry rehashes the artifact
 itself rather than believing a digest that was pasted into a pull request.
 
-Four things in that file are load-bearing, and each is a way it could go quietly
+Five things in that file are load-bearing, and each is a way it could go quietly
 wrong:
 
 - **The `uses:` is pinned to a 40-character SHA**, never a branch and never a
@@ -172,6 +172,19 @@ wrong:
   from the GitHub release body. It renders in a text widget in the app, so
   asterisks arrive as asterisks; a release body is Markdown and is editable
   after the fact, which would make the published notes quietly stop matching it.
+- **Everything after the release is created has to be re-runnable, and the
+  release step is written that way.** A re-run starts the job at step one, so it
+  creates the release *or completes* one a previous attempt left behind —
+  publishing it if it is a draft, uploading the zip if that upload never landed
+  — where a plain `gh release create` would fail on a tag that already has a
+  release and leave `publish` skipped with no way out but deleting a published
+  release by hand. It never clobbers an asset an earlier attempt uploaded:
+  `zip` records mtimes, so a rebuild of the same commit is not the same bytes,
+  and if the registry already recorded this version those earlier bytes are the
+  ones it hashed. That is also why the sha256 sent to the registry is taken off
+  the release asset rather than off the local zip — and why the step that takes
+  it hard-fails when *this* run's upload and the download disagree, which
+  nothing benign explains.
 - **`state: pending` is a success.** A plugin id's first release always goes to
   human review whatever the trust level, and the job passes with a warning
   annotation. Don't add a gate that fails the pipeline on it — that would be
